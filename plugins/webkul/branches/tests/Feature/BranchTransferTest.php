@@ -201,7 +201,7 @@ it('rejects confirm when the source branch is short on stock', function () {
     $this->service->confirm($transfer);
 })->throws(ValidationException::class);
 
-it('moves stock on confirm, ship and receive, and posts no accounting', function () {
+it('moves stock on confirm, ship and receive, and posts the mirrored invoices', function () {
     $product = transferProduct($this->company->id, $this->admin->getKey());
     stockAt($product, $this->main, 10);
 
@@ -217,36 +217,42 @@ it('moves stock on confirm, ship and receive, and posts no accounting', function
         ->and($transfer->in_invoice_id)->toBeNull();
 
     // Confirm: outbound Operation created, stock reserved at Main.
+    // Still no accounting — nothing has shipped yet.
     $transfer = $this->service->confirm($transfer);
 
     expect($transfer->status)->toBe(TransferStatus::Confirmed)
         ->and($transfer->operation_id)->not->toBeNull()
+        ->and($transfer->out_invoice_id)->toBeNull()
         ->and(DB::table('inventories_operations')->count())->toBe($before['operations'] + 1)
         ->and((float) ProductQuantity::query()
             ->where('product_id', $product->getKey())
             ->where('location_id', $this->main->warehouse->lot_stock_location_id)
             ->sum('reserved_quantity'))->toBe(5.0);
 
-    // Ship: Main stock falls, goods sit in transit.
+    // Ship: Main stock falls, goods sit in transit, out_invoice +
+    // COGS post (Phase 4).
     $transfer = $this->service->ship($transfer);
 
     expect($transfer->status)->toBe(TransferStatus::InTransit)
         ->and((float) $transfer->lines->first()->quantity_shipped)->toBe(5.0)
+        ->and($transfer->out_invoice_id)->not->toBeNull()
+        ->and($transfer->cogs_move_id)->not->toBeNull()
         ->and((float) ProductQuantity::query()
             ->where('product_id', $product->getKey())
             ->where('location_id', $this->main->warehouse->lot_stock_location_id)
             ->sum('quantity'))->toBe(5.0);
 
-    // Receive: Sub stock rises by the received quantity.
+    // Receive: Sub stock rises by the received quantity, in_invoice posts.
     $transfer = $this->service->receive($transfer);
 
     expect($transfer->status)->toBe(TransferStatus::Received)
         ->and((float) $transfer->lines->first()->quantity_received)->toBe(5.0)
+        ->and($transfer->in_invoice_id)->not->toBeNull()
         ->and((float) ProductQuantity::query()
             ->where('product_id', $product->getKey())
             ->where('location_id', $this->sub->warehouse->lot_stock_location_id)
             ->sum('quantity'))->toBe(5.0)
-        ->and(DB::table('accounts_account_moves')->count())->toBe($before['account_moves']);
+        ->and(DB::table('accounts_account_moves')->count())->toBeGreaterThan($before['account_moves']);
 
     expect($transfer->histories()->count())->toBeGreaterThanOrEqual(4);
 });

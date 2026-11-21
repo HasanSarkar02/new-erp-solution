@@ -7,6 +7,8 @@ use Filament\Infolists\Components\TextEntry;
 use Filament\Schemas\Components\Group;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Schema;
+use Webkul\Branch\Models\Branch;
+use Webkul\Branch\Services\BranchBalanceService;
 
 class BranchInfolist
 {
@@ -41,6 +43,36 @@ class BranchInfolist
                                 TextEntry::make('zip')->label('ZIP / Postal code'),
                                 TextEntry::make('state.name')->label('State'),
                                 TextEntry::make('country.name')->label('Country'),
+                            ])
+                            ->columns(2),
+
+                        Section::make('Branch balances')
+                            ->description('Read live from the internal invoice residuals (plan §5.3) — never from a stored balance.')
+                            ->schema([
+                                TextEntry::make('receivable_outstanding')
+                                    ->label('Receivable outstanding')
+                                    ->money('BDT')
+                                    ->state(fn (Branch $record) => app(BranchBalanceService::class)->receivableOutstanding($record)),
+                                TextEntry::make('payable_outstanding')
+                                    ->label('Payable outstanding')
+                                    ->money('BDT')
+                                    ->state(fn (Branch $record) => app(BranchBalanceService::class)->payableOutstanding($record)),
+                                TextEntry::make('net_outstanding')
+                                    ->label('Net outstanding')
+                                    ->money('BDT')
+                                    ->state(fn (Branch $record) => app(BranchBalanceService::class)->netOutstanding($record)),
+                                TextEntry::make('overdue_receivable')
+                                    ->label('Overdue receivable')
+                                    ->money('BDT')
+                                    ->state(fn (Branch $record) => app(BranchBalanceService::class)->overdueReceivable($record)),
+                                TextEntry::make('total_transferred')
+                                    ->label('Total transferred in')
+                                    ->money('BDT')
+                                    ->state(fn (Branch $record) => app(BranchBalanceService::class)->totalTransferred($record)),
+                                TextEntry::make('total_paid')
+                                    ->label('Total paid')
+                                    ->money('BDT')
+                                    ->state(fn (Branch $record) => app(BranchBalanceService::class)->totalPaid($record)),
                             ])
                             ->columns(2),
                     ])

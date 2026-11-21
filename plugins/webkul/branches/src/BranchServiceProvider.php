@@ -6,13 +6,16 @@ use Filament\Panel;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Schema;
+use Webkul\Branch\Console\Commands\CheckBalancesCommand;
 use Webkul\Branch\Models\Branch;
 use Webkul\Branch\Models\BranchTransferSale;
 use Webkul\Branch\Policies\BranchPolicy;
 use Webkul\Branch\Policies\BranchTransferSalePolicy;
+use Webkul\Branch\Services\BranchBalanceService;
 use Webkul\Branch\Services\BranchService;
 use Webkul\Branch\Services\BranchTransferPriceService;
 use Webkul\Branch\Services\BranchTransferService;
+use Webkul\Branch\Services\InterBranchAccountingService;
 use Webkul\Branch\Services\StockLayerService;
 use Webkul\Branch\Services\TransferStockService;
 use Webkul\PluginManager\Console\Commands\InstallCommand;
@@ -42,6 +45,14 @@ class BranchServiceProvider extends PackageServiceProvider
                 '2026_11_21_100010_create_stock_layer_consumptions_table',
                 '2026_11_21_100011_add_branch_columns_to_inventories_operations_and_moves_tables',
                 '2026_11_21_100012_add_receipt_operation_id_to_branch_transfer_sales_table',
+                '2026_11_21_100013_add_branch_columns_to_accounts_moves_and_lines',
+                '2026_11_21_100014_add_branch_id_to_sales_orders',
+                '2026_11_21_100015_create_inter_branch_payments_table',
+                '2026_11_21_100016_create_inter_branch_payment_allocations_table',
+                '2026_11_21_100017_add_cogs_move_and_payment_state_to_branch_transfer_sales',
+            ])
+            ->hasCommands([
+                CheckBalancesCommand::class,
             ])
             ->runsMigrations()
             ->hasSeeder('Webkul\\Branch\\Database\\Seeders\\DatabaseSeeder')
@@ -105,6 +116,8 @@ class BranchServiceProvider extends PackageServiceProvider
         $this->app->singleton(BranchTransferPriceService::class);
         $this->app->singleton(StockLayerService::class);
         $this->app->singleton(TransferStockService::class);
+        $this->app->singleton(InterBranchAccountingService::class);
+        $this->app->singleton(BranchBalanceService::class);
         $this->app->singleton(BranchTransferService::class);
     }
 }

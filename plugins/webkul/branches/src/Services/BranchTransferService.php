@@ -26,18 +26,15 @@ use Webkul\Support\Models\Sequence;
 /**
  * Internal Transfer Sale lifecycle (plan §7.1, §7.2, §7.5).
  *
- * Phase 3 — stock movement is live:
- * - confirm: creates the outbound Operation (Stock → Transit) and
- *   reserves the stock at the source branch.
- * - ship: consumes the FIFO layers, captures the cost per line, and
- *   completes the outbound Operation (stock leaves the source).
- * - receive: creates + completes a receipt Operation (Transit →
- *   destination Stock) and creates the destination stock layers
- *   at the transfer price P.
- * - cancel before ship: releases the reservation and cancels the
- *   Operation.
- * - A draft still has no stock effect. Accounting (Phase 4) is not
- *   posted anywhere here: no invoices, no Moves, no CoA changes.
+ * Phase 4 — accounting is live:
+ * - ship: posts Entry 1 (out_invoice at P) + Entry 2 (COGS at C)
+ *   in the same transaction as the stock transition.
+ * - receive: posts Entry 3 (in_invoice at P) per receipt event.
+ * - cancel after ship: reverses the ship entries to zero and
+ *   returns the in-transit stock to the source branch. A transfer
+ *   with any payment recorded cannot be cancelled — settle the
+ *   payment first (the money is already held on the legs).
+ * - A draft still has no stock or accounting effect (asserted in tests).
  *
  * Invariants enforced here (§7.2):
  * - quantity_received <= quantity_shipped <= quantity per line.
@@ -58,7 +55,14 @@ class BranchTransferService
         protected BranchTransferPriceService $priceService,
         protected TransferStockService $stockService,
         protected StockLayerService $layerService,
+        protected ?InterBranchAccountingService $accountingService = null,
     ) {}
+
+    /** The accounting service, resolved lazily for tests that build this service by hand. */
+    protected function accounting(): InterBranchAccountingService
+    {
+        return $this->accountingService ??= app(InterBranchAccountingService::class);
+    }
 
     /**
      * Validate a creation payload the way create() does, without
@@ -283,6 +287,12 @@ class BranchTransferService
 
             $source = Branch::withoutGlobalScopes()->find($transfer->source_branch_id);
 
+            // Phase 4: post Entry 1 (out_invoice at P) + Entry 2
+            // (COGS at C) in the same transaction as the stock move.
+            // The FIFO cost per line is captured by shipOutboundOperation
+            // just above, so postShipEntries sees the final C.
+            $this->accounting()->postShipEntries($transfer->refresh());
+
             $this->transition($transfer, TransferStatus::InTransit, $actor, 'Goods shipped from '.($source?->name ?? 'source branch').'.');
 
             return $transfer->refresh();
@@ -335,10 +345,9 @@ class BranchTransferService
                 $this->stockService->createReceiptOperation($transfer->refresh(), $receivedThisCall);
             }
 
-            // Phase 4 hook: post Entry (b) here.
-            // Phase 4 will flip the transfer to Completed once the
-            // invoices are posted; in Phase 2 a fully received transfer
-            // stops at Received.
+            // Phase 4: post Entry 3 (in_invoice at P) for the
+            // quantities received in this call.
+            $this->accounting()->postReceiptEntries($transfer->refresh(), $receivedThisCall);
 
             $status = $transfer->isFullyReceived()
                 ? TransferStatus::Received
@@ -357,12 +366,14 @@ class BranchTransferService
     }
 
     /**
-     * Cancel a transfer before it ships. Draft or confirmed only.
+     * Cancel a transfer.
      *
-     * Phase 3: a confirmed transfer releases its reservation and
-     * cancels its outbound Operation. A draft has no operation yet.
-     * Phase 4 hook: no accounting exists yet before ship, so nothing
-     * to reverse; after ship, cancellation goes through the return flow.
+     * Draft or confirmed: releases the reservation and cancels the
+     * outbound Operation (Phase 3). In transit (Phase 4): reverses
+     * the ship entries to zero and returns the in-transit stock to
+     * the source branch. A transfer with any payment recorded cannot
+     * be cancelled — the money is already held on the payment legs,
+     * so settle or reverse the payment first.
      */
     public function cancel(BranchTransferSale $transfer, ?User $actor = null, ?string $note = null): BranchTransferSale
     {
@@ -371,9 +382,23 @@ class BranchTransferService
         return DB::transaction(function () use ($transfer, $actor, $note) {
             $transfer = $transfer->fresh();
 
-            $this->assertStatus($transfer, [TransferStatus::Draft, TransferStatus::Confirmed]);
+            $this->assertStatus($transfer, [TransferStatus::Draft, TransferStatus::Confirmed, TransferStatus::InTransit]);
 
-            if ($transfer->operation_id) {
+            if ($transfer->status === TransferStatus::InTransit) {
+                if ((float) $transfer->amount_paid > 0) {
+                    throw ValidationException::withMessages([
+                        'status' => 'This transfer already has payments recorded and cannot be cancelled. Reverse the payment first.',
+                    ]);
+                }
+
+                // Reverse the accounting to zero, then bring the
+                // in-transit stock home, in one transaction.
+                $this->accounting()->reverseShipEntries($transfer->refresh());
+
+                if ($this->stockService->movesStock($transfer) && $transfer->operation_id) {
+                    $this->stockService->returnTransitToSource($transfer->refresh());
+                }
+            } elseif ($transfer->operation_id) {
                 $operation = Operation::query()->find($transfer->operation_id);
 
                 if ($operation) {

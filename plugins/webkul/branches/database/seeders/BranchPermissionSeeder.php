@@ -39,6 +39,8 @@ class BranchPermissionSeeder extends Seeder
         'receive_transfer',
         'cancel_transfer',
         'return_transfer',
+        'record_inter_branch_payment',
+        'approve_transfer',
         'view_any_branch_transfer_sale',
         'view_transfer_price_rule',
         'create_transfer_price_rule',

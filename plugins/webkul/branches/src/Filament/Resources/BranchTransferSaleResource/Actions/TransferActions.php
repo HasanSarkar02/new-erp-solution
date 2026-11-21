@@ -3,6 +3,7 @@
 namespace Webkul\Branch\Filament\Resources\BranchTransferSaleResource\Actions;
 
 use Filament\Actions\Action;
+use Filament\Forms\Components\DatePicker;
 use Filament\Forms\Components\Repeater;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\Textarea;
@@ -12,6 +13,7 @@ use Illuminate\Support\Facades\Gate;
 use Webkul\Branch\Enums\TransferStatus;
 use Webkul\Branch\Models\BranchTransferSale;
 use Webkul\Branch\Services\BranchTransferService;
+use Webkul\Branch\Services\InterBranchAccountingService;
 
 /**
  * Header actions for the transfer view page (plan §7.1, §8.2).
@@ -31,6 +33,7 @@ class TransferActions
             static::confirmAction(),
             static::shipAction(),
             static::receiveAction(),
+            static::recordPaymentAction(),
             static::cancelAction(),
             static::returnAction(),
         ];
@@ -108,7 +111,58 @@ class TransferActions
 
                 app(BranchTransferService::class)->ship($record, null, $quantities);
 
-                Notification::make()->title('Transfer shipped. In Phase 2 this is a status change only — no stock moves yet.')->success()->send();
+                Notification::make()->title('Transfer shipped. Stock moved to transit and the invoices + COGS were posted.')->success()->send();
+            });
+    }
+
+    /**
+     * Record a payment from the destination branch to the source
+     * branch (Phase 4, plan §5.2c). Main records the payment even
+     * when the money was handed over at a Sub branch.
+     */
+    protected static function recordPaymentAction(): Action
+    {
+        return Action::make('recordPayment')
+            ->label('Record payment')
+            ->icon('heroicon-o-banknotes')
+            ->color('success')
+            ->visible(fn (BranchTransferSale $record) => $record->out_invoice_id !== null && (float) $record->amount_residual > 0)
+            ->authorize(fn (BranchTransferSale $record) => Gate::allows('recordPayment', $record))
+            ->form(fn (BranchTransferSale $record) => [
+                TextInput::make('amount')
+                    ->label('Amount (BDT)')
+                    ->numeric()
+                    ->required()
+                    ->minValue(0.0001)
+                    ->maxValue((float) $record->amount_residual)
+                    ->default((float) $record->amount_residual),
+                DatePicker::make('payment_date')
+                    ->label('Payment date')
+                    ->required()
+                    ->default(now()->toDateString()),
+                TextInput::make('reference')
+                    ->label('Reference')
+                    ->maxLength(255),
+                Textarea::make('memo')
+                    ->label('Memo')
+                    ->rows(2),
+            ])
+            ->action(function (BranchTransferSale $record, array $data) {
+                $record->loadMissing(['sourceBranch', 'destinationBranch']);
+
+                app(InterBranchAccountingService::class)->recordPayment(
+                    $record->destinationBranch,
+                    $record->sourceBranch,
+                    (float) $data['amount'],
+                    $data['payment_date'],
+                    [
+                        'reference'   => $data['reference'] ?? null,
+                        'memo'        => $data['memo'] ?? null,
+                        'allocations' => [$record->getKey() => (float) $data['amount']],
+                    ],
+                );
+
+                Notification::make()->title('Payment recorded and reconciled against the transfer invoices.')->success()->send();
             });
     }
 
@@ -152,7 +206,7 @@ class TransferActions
 
                 app(BranchTransferService::class)->receive($record, null, $quantities);
 
-                Notification::make()->title('Receipt recorded. In Phase 2 this is a status change only — no stock moves yet.')->success()->send();
+                Notification::make()->title('Receipt recorded. Stock moved in and the payable invoice was posted.')->success()->send();
             });
     }
 
@@ -162,7 +216,7 @@ class TransferActions
             ->label('Cancel')
             ->icon('heroicon-o-x-mark')
             ->color('danger')
-            ->visible(fn (BranchTransferSale $record) => in_array($record->status, [TransferStatus::Draft, TransferStatus::Confirmed], true))
+            ->visible(fn (BranchTransferSale $record) => in_array($record->status, [TransferStatus::Draft, TransferStatus::Confirmed, TransferStatus::InTransit], true))
             ->authorize(fn (BranchTransferSale $record) => Gate::allows('cancel', $record))
             ->form([
                 Textarea::make('note')->label('Reason')->rows(2),

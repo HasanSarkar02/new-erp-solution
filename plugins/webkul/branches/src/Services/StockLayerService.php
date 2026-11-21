@@ -133,7 +133,17 @@ class StockLayerService
      * §6.3 rule 2): stock is valued at the transfer price P, and
      * the original FIFO cost C is kept for the Phase 4 elimination.
      */
-    public function createReceiptLayer(BranchTransferSaleLine $line, float $quantity, Branch $destination, int $locationId): StockLayer
+    /**
+     * Create a receipt layer for goods received at a branch.
+     *
+     * Normally valued at the transfer price P (unit_cost = P,
+     * original_cost_unit = FIFO cost C from the source). For a
+     * return receipt at Main the goods go back at their original
+     * cost C, so the caller passes $unitCostOverride = C and the
+     * layer is valued at C throughout — that is what the ledger
+     * posts (Dr 110100 C), so layer and ledger must agree (Phase 4).
+     */
+    public function createReceiptLayer(BranchTransferSaleLine $line, float $quantity, Branch $destination, int $locationId, ?float $unitCostOverride = null): StockLayer
     {
         return StockLayer::create([
             'company_id'         => $destination->company_id,
@@ -146,13 +156,34 @@ class StockLayerService
             'source_id'          => $line->getKey(),
             'quantity_initial'   => round($quantity, 4),
             'quantity_remaining' => round($quantity, 4),
-            'unit_cost'          => round((float) $line->transfer_price_unit, 4),
-            'original_cost_unit' => $line->cost_price_unit === null
-                ? null
-                : round((float) $line->cost_price_unit, 4),
+            'unit_cost'          => round($unitCostOverride ?? (float) $line->transfer_price_unit, 4),
+            'original_cost_unit' => $unitCostOverride !== null
+                ? round($unitCostOverride, 4)
+                : ($line->cost_price_unit === null ? null : round((float) $line->cost_price_unit, 4)),
             'currency_id'        => $line->transfer?->currency_id,
             'incoming_at'        => now(),
         ]);
+    }
+
+    /**
+     * Undo a FIFO consumption: put the consumed quantities back on
+     * their layers (cancel after ship). The consumption rows are
+     * deleted — the ship is fully unwound, and the cancel is recorded
+     * in the transfer history.
+     */
+    public function restoreConsumptions(BranchTransferSaleLine $line): void
+    {
+        foreach ($line->consumptions as $consumption) {
+            $layer = $consumption->layer;
+
+            if ($layer) {
+                $layer->forceFill([
+                    'quantity_remaining' => round((float) $layer->quantity_remaining + (float) $consumption->quantity, 4),
+                ])->save();
+            }
+
+            $consumption->delete();
+        }
     }
 
     /** Total stock value at a branch (SUM remaining × unit cost). */

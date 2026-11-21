@@ -327,7 +327,27 @@ it('unwinds stock at the stored price and cost on return', function () {
         ->and(onHandAt($product, $this->main->warehouse->lot_stock_location_id))->toBe(10.0)
         ->and(onHandAt($product, $this->sub->warehouse->lot_stock_location_id))->toBe(0.0)
         ->and(onHandAt($product, transitLocationId()))->toBe(0.0)
-        ->and(DB::table('accounts_account_moves')->count())->toBe(0);
+        // Phase 4: the return posts an in_refund + COGS reversal at
+        // ship and an out_refund at receive. The parent's receivable
+        // and payable both fall to zero, and the Main stock layer
+        // comes back at the ORIGINAL cost (100), not at P (150).
+        ->and($returnTransfer->in_invoice_id)->not->toBeNull()
+        ->and($returnTransfer->out_invoice_id)->not->toBeNull()
+        ->and($returnTransfer->cogs_move_id)->not->toBeNull();
+
+    $parent = $transfer->refresh();
+
+    expect((float) $parent->outInvoice->amount_residual)->toBe(0.0)
+        ->and((float) $parent->inInvoice->amount_residual)->toBe(0.0);
+
+    $mainLayer = StockLayer::query()
+        ->where('branch_id', $this->main->getKey())
+        ->where('product_id', $product->getKey())
+        ->where('quantity_remaining', '>', 0)
+        ->orderByDesc('id')
+        ->firstOrFail();
+
+    expect((float) $mainLayer->unit_cost)->toBe(100.0);
 });
 
 it('moves no stock for a service-only transfer', function () {

@@ -7,6 +7,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Carbon;
+use Webkul\Account\Models\Move;
 use Webkul\Branch\Enums\TransferStatus;
 use Webkul\Branch\Enums\TransferType;
 use Webkul\Branch\Services\BranchTransferService;
@@ -41,6 +42,7 @@ class BranchTransferSale extends Model
         'receipt_operation_id',
         'out_invoice_id',
         'in_invoice_id',
+        'cogs_move_id',
         'parent_transfer_id',
         'name',
         'reference',
@@ -55,6 +57,7 @@ class BranchTransferSale extends Model
         'amount_cost_total',
         'amount_paid',
         'amount_residual',
+        'payment_state',
         'payment_terms_days',
         'due_date',
         'approved_by',
@@ -136,6 +139,24 @@ class BranchTransferSale extends Model
         return $this->belongsTo(self::class, 'parent_transfer_id');
     }
 
+    /** Out_invoice posted at ship (Main bills Sub at P). Phase 4. */
+    public function outInvoice(): BelongsTo
+    {
+        return $this->belongsTo(Move::class, 'out_invoice_id');
+    }
+
+    /** In_invoice posted at receive (Sub owes Main at P). Phase 4. */
+    public function inInvoice(): BelongsTo
+    {
+        return $this->belongsTo(Move::class, 'in_invoice_id');
+    }
+
+    /** COGS ENTRY posted at ship (Main, at FIFO cost C). Phase 4. */
+    public function cogsMove(): BelongsTo
+    {
+        return $this->belongsTo(Move::class, 'cogs_move_id');
+    }
+
     public function currency(): BelongsTo
     {
         return $this->belongsTo(Currency::class);
@@ -179,18 +200,38 @@ class BranchTransferSale extends Model
      * Recompute the cached totals from the lines. Cost totals stay 0
      * until Phase 3 captures the FIFO cost (C) at ship time.
      * Query-based sums, so it works even with a stale lines relation.
+     *
+     * Once an out_invoice exists (Phase 4), the invoice is the
+     * commercial truth: amount_paid / amount_residual / payment_state
+     * come from it, not from the ordered totals — a partial shipment
+     * is only billable for what shipped.
      */
     public function recomputeTotals(): void
     {
         $untaxed = (float) $this->lines()->sum('price_subtotal');
         $cost = (float) $this->lines()->sum('cost_subtotal');
 
-        $this->forceFill([
+        $values = [
             'amount_untaxed'    => $untaxed,
             'amount_total'      => $untaxed,
             'amount_cost_total' => $cost,
-            'amount_residual'   => $untaxed - (float) $this->amount_paid,
-        ])->save();
+        ];
+
+        if ($this->out_invoice_id && $this->type !== TransferType::Return) {
+            $invoice = Move::query()->find($this->out_invoice_id);
+
+            if ($invoice) {
+                $values['amount_paid'] = round((float) $invoice->amount_total - (float) $invoice->amount_residual, 4);
+                $values['amount_residual'] = round((float) $invoice->amount_residual, 4);
+                $values['payment_state'] = $invoice->payment_state instanceof \BackedEnum
+                    ? $invoice->payment_state->value
+                    : (string) $invoice->payment_state;
+            }
+        } else {
+            $values['amount_residual'] = $untaxed - (float) $this->amount_paid;
+        }
+
+        $this->forceFill($values)->save();
     }
 
     public function isFullyReceived(): bool

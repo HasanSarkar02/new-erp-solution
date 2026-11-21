@@ -5,6 +5,7 @@ namespace Webkul\Branch\Services;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Validation\ValidationException;
 use Throwable;
+use Webkul\Branch\Enums\TransferType;
 use Webkul\Branch\Models\Branch;
 use Webkul\Branch\Models\BranchTransferSale;
 use Webkul\Branch\Models\BranchTransferSaleLine;
@@ -329,11 +330,95 @@ class TransferStockService
             $received = round((float) ($receivedQuantities[$line->getKey()] ?? 0), 4);
 
             if ($received > 0) {
-                $this->layers->createReceiptLayer($line, $received, $destination, $destinationLocation->getKey());
+                // A return receipt goes back to Main at the original
+                // FIFO cost C, not at the transfer price P — the
+                // ledger posts Dr 110100 C, so the layer must match
+                // (Phase 4). The original line's stored cost is the C.
+                $unitCostOverride = null;
+
+                if ($transfer->type === TransferType::Return && $transfer->parent_transfer_id) {
+                    $originalLine = BranchTransferSaleLine::query()
+                        ->where('transfer_id', $transfer->parent_transfer_id)
+                        ->where('product_id', $line->product_id)
+                        ->first();
+
+                    if ($originalLine && $originalLine->cost_price_unit !== null) {
+                        $unitCostOverride = (float) $originalLine->cost_price_unit;
+                    }
+                }
+
+                $this->layers->createReceiptLayer($line, $received, $destination, $destinationLocation->getKey(), $unitCostOverride);
             }
         }
 
         return $operation;
+    }
+
+    /**
+     * Return in-transit stock to the source branch (cancel after
+     * ship, Phase 4): build the engine return of the outbound
+     * operation (Transit → source Stock), complete it, and restore
+     * the FIFO layers the ship consumed.
+     */
+    public function returnTransitToSource(BranchTransferSale $transfer): ?Operation
+    {
+        $outbound = Operation::query()->find($transfer->operation_id);
+
+        if (! $outbound) {
+            return null;
+        }
+
+        $outbound->loadMissing('moves');
+
+        $moveQuantities = [];
+
+        foreach ($this->stockLines($transfer) as $line) {
+            $move = $outbound->moves->firstWhere('product_id', $line->product_id);
+
+            if (! $move) {
+                continue;
+            }
+
+            $moveQuantities[$move->getKey()] = (float) $line->quantity_shipped;
+        }
+
+        if ($moveQuantities === []) {
+            return null;
+        }
+
+        $returnOperation = app(TransferWorkflow::class)
+            ->createReturn($outbound, $moveQuantities);
+
+        $returnOperation->forceFill([
+            'branch_transfer_sale_id' => $transfer->getKey(),
+            'source_branch_id'        => $transfer->destination_branch_id,
+            'destination_branch_id'   => $transfer->source_branch_id,
+        ])->save();
+
+        foreach ($returnOperation->moves as $move) {
+            $move->forceFill([
+                'branch_transfer_sale_id' => $transfer->getKey(),
+                'branch_id'               => $transfer->destination_branch_id,
+            ])->save();
+        }
+
+        $returnOperation->refresh();
+
+        InventoryFacade::completeTransfer($returnOperation);
+
+        $returnOperation->refresh();
+
+        if ($returnOperation->state !== OperationState::DONE) {
+            throw ValidationException::withMessages([
+                'status' => "The stock return operation {$returnOperation->name} did not complete (state: {$returnOperation->state->value}).",
+            ]);
+        }
+
+        foreach ($this->stockLines($transfer) as $line) {
+            $this->layers->restoreConsumptions($line);
+        }
+
+        return $returnOperation;
     }
 
     /** Release the reservations of a not-yet-shipped operation. */

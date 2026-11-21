@@ -67,6 +67,11 @@ class BranchService
 
             $this->linkPartnerToBranch($partner, $branch);
 
+            // Phase 4: point the new branch Partner at the internal
+            // accounts (121500 / 211500) so invoice payment-term lines
+            // land on the right accounts from the first transfer.
+            app(InterBranchAccountingService::class)->ensureBranchPartnerAccounts($branch->refresh());
+
             if ($type->holdsStock()) {
                 $warehouse = $this->resolveWarehouse($data, $branch);
                 $branch->forceFill(['warehouse_id' => $warehouse->getKey()])->save();

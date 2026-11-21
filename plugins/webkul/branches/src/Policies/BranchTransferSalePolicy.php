@@ -85,6 +85,16 @@ class BranchTransferSalePolicy
         return $user->can('view_all_branches') && $transfer->requiresMainApproval();
     }
 
+    /**
+     * Record a payment (Phase 4, plan §5.2c): Main records the
+     * payment even when the money was handed over at a Sub branch,
+     * so only a Main / head-office user may do it.
+     */
+    public function recordPayment(User $user, BranchTransferSale $transfer): bool
+    {
+        return $user->can('record_inter_branch_payment') && $user->can('view_all_branches');
+    }
+
     protected function isInvolved(User $user, BranchTransferSale $transfer): bool
     {
         return $this->isAssigned($user, (int) $transfer->source_branch_id)

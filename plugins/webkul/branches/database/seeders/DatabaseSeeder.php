@@ -14,6 +14,7 @@ class DatabaseSeeder extends Seeder
         $this->call([
             BranchPermissionSeeder::class,
             DemoBranchSeeder::class,
+            InternalAccountsSeeder::class,
         ]);
     }
 }
