@@ -4,6 +4,7 @@ namespace Webkul\Branch\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Webkul\Product\Models\Product;
 
 class BranchTransferSaleLine extends Model
@@ -59,6 +60,12 @@ class BranchTransferSaleLine extends Model
     public function product(): BelongsTo
     {
         return $this->belongsTo(Product::class, 'product_id');
+    }
+
+    /** FIFO consumption records for this line (Phase 3). */
+    public function consumptions(): HasMany
+    {
+        return $this->hasMany(StockLayerConsumption::class, 'transfer_line_id');
     }
 
     /**

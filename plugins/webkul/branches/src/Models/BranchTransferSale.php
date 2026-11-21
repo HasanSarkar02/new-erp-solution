@@ -10,6 +10,7 @@ use Illuminate\Support\Carbon;
 use Webkul\Branch\Enums\TransferStatus;
 use Webkul\Branch\Enums\TransferType;
 use Webkul\Branch\Services\BranchTransferService;
+use Webkul\Inventory\Models\Operation;
 use Webkul\Inventory\Models\Warehouse;
 use Webkul\Security\Models\User;
 use Webkul\Support\Models\Company;
@@ -37,6 +38,7 @@ class BranchTransferSale extends Model
         'source_warehouse_id',
         'destination_warehouse_id',
         'operation_id',
+        'receipt_operation_id',
         'out_invoice_id',
         'in_invoice_id',
         'parent_transfer_id',
@@ -115,6 +117,18 @@ class BranchTransferSale extends Model
     public function destinationWarehouse(): BelongsTo
     {
         return $this->belongsTo(Warehouse::class, 'destination_warehouse_id');
+    }
+
+    /** Outbound stock Operation (Stock → Transit), created at confirm. */
+    public function operation(): BelongsTo
+    {
+        return $this->belongsTo(Operation::class, 'operation_id');
+    }
+
+    /** Latest receipt Operation (Transit → destination Stock). */
+    public function receiptOperation(): BelongsTo
+    {
+        return $this->belongsTo(Operation::class, 'receipt_operation_id');
     }
 
     public function parentTransfer(): BelongsTo

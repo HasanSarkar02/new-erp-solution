@@ -56,6 +56,7 @@ function transferProduct(int $companyId, int $adminId, array $overrides = []): P
         'creator_id'      => $adminId,
         'cost'            => 100,
         'price'           => 150,
+        'is_storable'     => true,
         'is_configurable' => false,
     ], $overrides));
 }
@@ -200,7 +201,7 @@ it('rejects confirm when the source branch is short on stock', function () {
     $this->service->confirm($transfer);
 })->throws(ValidationException::class);
 
-it('moves a draft through confirm, ship and receive with no stock or accounting effect', function () {
+it('moves stock on confirm, ship and receive, and posts no accounting', function () {
     $product = transferProduct($this->company->id, $this->admin->getKey());
     stockAt($product, $this->main, 10);
 
@@ -208,25 +209,44 @@ it('moves a draft through confirm, ship and receive with no stock or accounting 
 
     $transfer = $this->service->create(transferData($product, $this->main, $this->sub));
 
+    // Draft: no stock effect yet.
     expect(countStockAndAccounting())->toBe($before)
         ->and($transfer->status)->toBe(TransferStatus::Draft)
         ->and($transfer->operation_id)->toBeNull()
         ->and($transfer->out_invoice_id)->toBeNull()
         ->and($transfer->in_invoice_id)->toBeNull();
 
+    // Confirm: outbound Operation created, stock reserved at Main.
     $transfer = $this->service->confirm($transfer);
-    expect($transfer->status)->toBe(TransferStatus::Confirmed)
-        ->and(countStockAndAccounting())->toBe($before);
 
+    expect($transfer->status)->toBe(TransferStatus::Confirmed)
+        ->and($transfer->operation_id)->not->toBeNull()
+        ->and(DB::table('inventories_operations')->count())->toBe($before['operations'] + 1)
+        ->and((float) ProductQuantity::query()
+            ->where('product_id', $product->getKey())
+            ->where('location_id', $this->main->warehouse->lot_stock_location_id)
+            ->sum('reserved_quantity'))->toBe(5.0);
+
+    // Ship: Main stock falls, goods sit in transit.
     $transfer = $this->service->ship($transfer);
+
     expect($transfer->status)->toBe(TransferStatus::InTransit)
         ->and((float) $transfer->lines->first()->quantity_shipped)->toBe(5.0)
-        ->and(countStockAndAccounting())->toBe($before);
+        ->and((float) ProductQuantity::query()
+            ->where('product_id', $product->getKey())
+            ->where('location_id', $this->main->warehouse->lot_stock_location_id)
+            ->sum('quantity'))->toBe(5.0);
 
+    // Receive: Sub stock rises by the received quantity.
     $transfer = $this->service->receive($transfer);
+
     expect($transfer->status)->toBe(TransferStatus::Received)
         ->and((float) $transfer->lines->first()->quantity_received)->toBe(5.0)
-        ->and(countStockAndAccounting())->toBe($before);
+        ->and((float) ProductQuantity::query()
+            ->where('product_id', $product->getKey())
+            ->where('location_id', $this->sub->warehouse->lot_stock_location_id)
+            ->sum('quantity'))->toBe(5.0)
+        ->and(DB::table('accounts_account_moves')->count())->toBe($before['account_moves']);
 
     expect($transfer->histories()->count())->toBeGreaterThanOrEqual(4);
 });

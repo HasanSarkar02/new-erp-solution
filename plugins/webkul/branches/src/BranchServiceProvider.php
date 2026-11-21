@@ -13,6 +13,8 @@ use Webkul\Branch\Policies\BranchTransferSalePolicy;
 use Webkul\Branch\Services\BranchService;
 use Webkul\Branch\Services\BranchTransferPriceService;
 use Webkul\Branch\Services\BranchTransferService;
+use Webkul\Branch\Services\StockLayerService;
+use Webkul\Branch\Services\TransferStockService;
 use Webkul\PluginManager\Console\Commands\InstallCommand;
 use Webkul\PluginManager\Console\Commands\UninstallCommand;
 use Webkul\PluginManager\Package;
@@ -36,6 +38,10 @@ class BranchServiceProvider extends PackageServiceProvider
                 '2026_11_21_100006_create_branch_transfer_sale_lines_table',
                 '2026_11_21_100007_create_branch_transfer_price_rules_table',
                 '2026_11_21_100008_create_branch_transfer_sale_histories_table',
+                '2026_11_21_100009_create_stock_layers_table',
+                '2026_11_21_100010_create_stock_layer_consumptions_table',
+                '2026_11_21_100011_add_branch_columns_to_inventories_operations_and_moves_tables',
+                '2026_11_21_100012_add_receipt_operation_id_to_branch_transfer_sales_table',
             ])
             ->runsMigrations()
             ->hasSeeder('Webkul\\Branch\\Database\\Seeders\\DatabaseSeeder')
@@ -97,6 +103,8 @@ class BranchServiceProvider extends PackageServiceProvider
 
         $this->app->singleton(BranchService::class);
         $this->app->singleton(BranchTransferPriceService::class);
+        $this->app->singleton(StockLayerService::class);
+        $this->app->singleton(TransferStockService::class);
         $this->app->singleton(BranchTransferService::class);
     }
 }

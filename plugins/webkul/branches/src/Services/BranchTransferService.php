@@ -13,6 +13,7 @@ use Webkul\Branch\Models\Branch;
 use Webkul\Branch\Models\BranchTransferSale;
 use Webkul\Branch\Models\BranchTransferSaleHistory;
 use Webkul\Branch\Models\BranchTransferSaleLine;
+use Webkul\Inventory\Models\Operation;
 use Webkul\Inventory\Models\ProductQuantity;
 use Webkul\Inventory\Models\Warehouse;
 use Webkul\Product\Enums\ProductType;
@@ -25,14 +26,18 @@ use Webkul\Support\Models\Sequence;
 /**
  * Internal Transfer Sale lifecycle (plan §7.1, §7.2, §7.5).
  *
- * Phase 2 scope — document + pricing ONLY:
- * - create / confirm / ship / receive / cancel / return are status
- *   transitions. Each runs in ONE database transaction and writes a
- *   history row. Nothing here creates inventory Operations/Moves and
- *   nothing posts accounting Moves.
- * - Ship / receive record shipped / received quantities on the lines
- *   and derive the document status. The stock and accounting effects
- *   attach at the marked hook points in Phase 3 and Phase 4.
+ * Phase 3 — stock movement is live:
+ * - confirm: creates the outbound Operation (Stock → Transit) and
+ *   reserves the stock at the source branch.
+ * - ship: consumes the FIFO layers, captures the cost per line, and
+ *   completes the outbound Operation (stock leaves the source).
+ * - receive: creates + completes a receipt Operation (Transit →
+ *   destination Stock) and creates the destination stock layers
+ *   at the transfer price P.
+ * - cancel before ship: releases the reservation and cancels the
+ *   Operation.
+ * - A draft still has no stock effect. Accounting (Phase 4) is not
+ *   posted anywhere here: no invoices, no Moves, no CoA changes.
  *
  * Invariants enforced here (§7.2):
  * - quantity_received <= quantity_shipped <= quantity per line.
@@ -51,6 +56,8 @@ class BranchTransferService
 
     public function __construct(
         protected BranchTransferPriceService $priceService,
+        protected TransferStockService $stockService,
+        protected StockLayerService $layerService,
     ) {}
 
     /**
@@ -157,8 +164,10 @@ class BranchTransferService
      * Confirm a draft. Hard-blocks on shortage at the source warehouse
      * and on a missing Main approval for Sub → Sub transfers.
      *
-     * Phase 3 hook: create the inventories Operation (type INTERNAL)
-     * and reserve stock here, in this same transaction.
+     * Phase 3: creates the outbound Operation (Stock → Transit) and
+     * reserves the stock. Return transfers skip this step — their
+     * outbound operation is built at ship time from the original
+     * transfer's receipt operation (engine return mechanics).
      */
     public function confirm(BranchTransferSale $transfer, ?User $actor = null): BranchTransferSale
     {
@@ -171,7 +180,10 @@ class BranchTransferService
 
             $destination = Branch::withoutGlobalScopes()->findOrFail($transfer->destination_branch_id);
 
-            if (! $destination->canBeTransferDestination()) {
+            // Service transfers move no stock, so a service branch
+            // without a warehouse is a valid destination (same
+            // exemption as validateBranches at create time).
+            if ($transfer->type !== TransferType::Service && ! $destination->canBeTransferDestination()) {
                 throw ValidationException::withMessages([
                     'destination_branch_id' => 'The destination branch is inactive or has no warehouse.',
                 ]);
@@ -191,8 +203,16 @@ class BranchTransferService
                 ]);
             }
 
-            // Phase 3 hook: create the INTERNAL inventories Operation and
-            // reserve the lines' quantities on the source warehouse here.
+            if ($this->stockService->movesStock($transfer) && ! $this->isEngineReturn($transfer)) {
+                $source = Branch::withoutGlobalScopes()->findOrFail($transfer->source_branch_id);
+                $sourceLocation = $this->stockService->stockLocation($source);
+
+                foreach ($this->stockService->stockLines($transfer) as $line) {
+                    $this->layerService->ensureLayers($source, $line->product, $sourceLocation->getKey());
+                }
+
+                $this->stockService->createOutboundOperation($transfer);
+            }
 
             $this->transition($transfer, TransferStatus::Confirmed, $actor, 'Transfer confirmed.');
 
@@ -201,11 +221,11 @@ class BranchTransferService
     }
 
     /**
-     * Ship a confirmed transfer. Status only in Phase 2 — no stock
-     * moves and no accounting yet.
+     * Ship a confirmed transfer.
      *
-     * Phase 3 hook: pick/confirm the Moves, consume FIFO stock layers
-     * and capture cost_price_unit (C) per line here.
+     * Phase 3: consumes the FIFO layers, captures cost_price_unit
+     * (C) per line, and completes the outbound Operation so the
+     * stock leaves the source branch into transit.
      * Phase 4 hook: post Entry (a) — out_invoice + COGS/stock-out — here.
      *
      * @param  array<int, float>  $shippedQuantities  line id => shipped qty (default: full quantity)
@@ -237,9 +257,29 @@ class BranchTransferService
                 $line->forceFill(['quantity_shipped' => $shipped])->save();
             }
 
-            // Phase 3 hook: Moves → done for the shipped qty, FIFO layers
-            // consumed, cost_price_unit captured per line, here.
-            // Phase 4 hook: post Entry (a) here.
+            if ($this->stockService->movesStock($transfer)) {
+                if (! $transfer->operation_id && $this->isEngineReturn($transfer)) {
+                    $original = BranchTransferSale::query()->findOrFail($transfer->parent_transfer_id);
+
+                    $this->stockService->createReturnOperation($transfer, $original);
+                }
+
+                if (! $transfer->operation_id) {
+                    $source = Branch::withoutGlobalScopes()->findOrFail($transfer->source_branch_id);
+                    $sourceLocation = $this->stockService->stockLocation($source);
+
+                    foreach ($this->stockService->stockLines($transfer) as $line) {
+                        $this->layerService->ensureLayers($source, $line->product, $sourceLocation->getKey());
+                    }
+
+                    $this->stockService->createOutboundOperation($transfer->refresh());
+                }
+
+                $this->stockService->shipOutboundOperation(
+                    $transfer->refresh(),
+                    $shippedQuantities,
+                );
+            }
 
             $source = Branch::withoutGlobalScopes()->find($transfer->source_branch_id);
 
@@ -250,10 +290,11 @@ class BranchTransferService
     }
 
     /**
-     * Receive goods at the destination branch. Status only in Phase 2.
+     * Receive goods at the destination branch.
      *
-     * Phase 3 hook: create receipt Moves into the destination location
-     * and create Sub stock_layers at P (original_cost_unit = C) here.
+     * Phase 3: creates and completes a receipt Operation (Transit →
+     * destination Stock) and creates the destination stock layers
+     * at the transfer price P (original cost C kept on the layer).
      * Phase 4 hook: post Entry (b) — in_invoice for received qty — here.
      *
      * @param  array<int, float>  $receivedQuantities  line id => received qty (default: shipped qty)
@@ -267,8 +308,17 @@ class BranchTransferService
 
             $this->assertStatus($transfer, [TransferStatus::InTransit, TransferStatus::PartiallyReceived]);
 
+            // Quantities received in THIS call, captured before the
+            // lines are updated — the receipt operation and the new
+            // stock layers are built from exactly these numbers.
+            $receivedThisCall = [];
+
             foreach ($transfer->lines as $line) {
-                $received = (float) ($receivedQuantities[$line->getKey()] ?? $line->quantity_shipped);
+                $receivedThisCall[$line->getKey()] = (float) ($receivedQuantities[$line->getKey()] ?? $line->quantity_shipped);
+            }
+
+            foreach ($transfer->lines as $line) {
+                $received = $receivedThisCall[$line->getKey()];
 
                 if ($received < 0 || $received > (float) $line->quantity_shipped) {
                     throw ValidationException::withMessages([
@@ -281,7 +331,10 @@ class BranchTransferService
 
             $transfer->refresh();
 
-            // Phase 3 hook: receipt Moves + Sub stock_layers at P here.
+            if ($this->stockService->movesStock($transfer) && $transfer->destination_warehouse_id) {
+                $this->stockService->createReceiptOperation($transfer->refresh(), $receivedThisCall);
+            }
+
             // Phase 4 hook: post Entry (b) here.
             // Phase 4 will flip the transfer to Completed once the
             // invoices are posted; in Phase 2 a fully received transfer
@@ -306,9 +359,10 @@ class BranchTransferService
     /**
      * Cancel a transfer before it ships. Draft or confirmed only.
      *
-     * Phase 3 hook: release reservations and cancel the Operation here.
-     * Phase 4 hook: no accounting exists yet before ship, so nothing to
-     * reverse; after ship, cancellation goes through the return flow.
+     * Phase 3: a confirmed transfer releases its reservation and
+     * cancels its outbound Operation. A draft has no operation yet.
+     * Phase 4 hook: no accounting exists yet before ship, so nothing
+     * to reverse; after ship, cancellation goes through the return flow.
      */
     public function cancel(BranchTransferSale $transfer, ?User $actor = null, ?string $note = null): BranchTransferSale
     {
@@ -319,7 +373,13 @@ class BranchTransferService
 
             $this->assertStatus($transfer, [TransferStatus::Draft, TransferStatus::Confirmed]);
 
-            // Phase 3 hook: release reservations / cancel Operation here.
+            if ($transfer->operation_id) {
+                $operation = Operation::query()->find($transfer->operation_id);
+
+                if ($operation) {
+                    $this->stockService->cancelOperation($operation);
+                }
+            }
 
             $this->transition($transfer, TransferStatus::Cancelled, $actor, $note ?? 'Transfer cancelled.');
 
@@ -503,6 +563,18 @@ class BranchTransferService
         return $shortages;
     }
 
+    /**
+     * A return transfer whose stock must come back through the
+     * engine's return mechanics: type return with a parent transfer.
+     * Its outbound operation is built at ship time from the original
+     * transfer's receipt operation instead of at confirm time.
+     */
+    protected function isEngineReturn(BranchTransferSale $transfer): bool
+    {
+        return $transfer->type === TransferType::Return
+            && $transfer->parent_transfer_id !== null;
+    }
+
     protected function resolveType(Branch $source, Branch $destination, ?string $requestedType): TransferType
     {
         if ($requestedType) {
@@ -601,6 +673,16 @@ class BranchTransferService
             if ($product->is_configurable || $product->parent_id) {
                 throw ValidationException::withMessages([
                     'lines' => "Product {$product->name} is a configurable parent — pick a variant instead.",
+                ]);
+            }
+
+            // A goods product that is not storable holds no stock, so
+            // the engine would silently move nothing for it. Block it
+            // here with a clear message instead (service products are
+            // exempt — they never move stock by design).
+            if ($product->type !== ProductType::SERVICE && ! $product->is_storable) {
+                throw ValidationException::withMessages([
+                    'lines' => "Product {$product->name} is not storable — enable stock tracking on the product before transferring it.",
                 ]);
             }
         }
