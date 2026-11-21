@@ -7,8 +7,12 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Schema;
 use Webkul\Branch\Models\Branch;
+use Webkul\Branch\Models\BranchTransferSale;
 use Webkul\Branch\Policies\BranchPolicy;
+use Webkul\Branch\Policies\BranchTransferSalePolicy;
 use Webkul\Branch\Services\BranchService;
+use Webkul\Branch\Services\BranchTransferPriceService;
+use Webkul\Branch\Services\BranchTransferService;
 use Webkul\PluginManager\Console\Commands\InstallCommand;
 use Webkul\PluginManager\Console\Commands\UninstallCommand;
 use Webkul\PluginManager\Package;
@@ -28,6 +32,10 @@ class BranchServiceProvider extends PackageServiceProvider
                 '2026_11_21_100002_create_branch_user_table',
                 '2026_11_21_100003_add_branch_id_to_inventories_warehouses_table',
                 '2026_11_21_100004_add_branch_id_to_partners_partners_table',
+                '2026_11_21_100005_create_branch_transfer_sales_table',
+                '2026_11_21_100006_create_branch_transfer_sale_lines_table',
+                '2026_11_21_100007_create_branch_transfer_price_rules_table',
+                '2026_11_21_100008_create_branch_transfer_sale_histories_table',
             ])
             ->runsMigrations()
             ->hasSeeder('Webkul\\Branch\\Database\\Seeders\\DatabaseSeeder')
@@ -78,6 +86,7 @@ class BranchServiceProvider extends PackageServiceProvider
         }
 
         Gate::policy(Branch::class, BranchPolicy::class);
+        Gate::policy(BranchTransferSale::class, BranchTransferSalePolicy::class);
     }
 
     public function packageRegistered(): void
@@ -87,5 +96,7 @@ class BranchServiceProvider extends PackageServiceProvider
         });
 
         $this->app->singleton(BranchService::class);
+        $this->app->singleton(BranchTransferPriceService::class);
+        $this->app->singleton(BranchTransferService::class);
     }
 }
