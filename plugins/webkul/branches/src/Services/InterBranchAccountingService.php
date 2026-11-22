@@ -18,8 +18,10 @@ use Webkul\Account\Models\PaymentMethodLine;
 use Webkul\Account\Services\MoveWorkflow;
 use Webkul\Account\Services\Reconciler;
 use Webkul\Branch\Database\Seeders\InternalAccountsSeeder;
+use Webkul\Branch\Enums\BranchType;
 use Webkul\Branch\Enums\TransferType;
 use Webkul\Branch\Models\Branch;
+use Webkul\Branch\Models\BranchStockWriteOff;
 use Webkul\Branch\Models\BranchTransferSale;
 use Webkul\Branch\Models\BranchTransferSaleLine;
 use Webkul\Branch\Models\InterBranchPayment;
@@ -73,6 +75,12 @@ class InterBranchAccountingService
     public const TRANSIT_CODE = '110150';
 
     public const BANK_CODE = '101401';
+
+    /** Expense account for the part of a damaged return the Sub absorbs (Phase 5). */
+    public const DAMAGE_LOSS_CODE = '644000';
+
+    /** Expense account for goods lost / missing at a Sub branch (Phase 5). */
+    public const LOSS_SHORTAGE_CODE = '645000';
 
     public const RECEIVABLE_ACCOUNT_ID = 121500;
 
@@ -262,6 +270,22 @@ class InterBranchAccountingService
 
         $transfer->loadMissing(['parentTransfer.lines']);
 
+        // A damaged return credits only the agreed value V per line
+        // (credit_value_unit, defaulting to P when Main credits the
+        // full price). The Sub's payable falls by V, not P, and the
+        // difference (P − V) is the Sub's Inventory Damage Loss.
+        $isDamaged = $transfer->return_reason === 'damaged';
+
+        $creditUnit = fn (BranchTransferSaleLine $line): float => $isDamaged
+            ? (float) ($line->credit_value_unit ?? $line->transfer_price_unit)
+            : (float) $line->transfer_price_unit;
+
+        $totalCredit = $shippedLines->sum(fn (BranchTransferSaleLine $line) => round((float) $line->quantity_shipped * $creditUnit($line), 4));
+
+        $totalLoss = $isDamaged
+            ? $shippedLines->sum(fn (BranchTransferSaleLine $line) => round((float) $line->quantity_shipped * max(0.0, (float) $line->transfer_price_unit - $creditUnit($line)), 4))
+            : 0.0;
+
         $totalC = $shippedLines->sum(function (BranchTransferSaleLine $line) use ($transfer) {
             // The return line's own cost_price_unit is the Sub's layer
             // cost (= P). Main's COGS reversal must use the ORIGINAL
@@ -275,25 +299,32 @@ class InterBranchAccountingService
             return round((float) $line->quantity_shipped * (float) $unitCost, 4);
         });
 
-        // Entry 1 (return ship): in_refund at P — the Sub's payable falls.
-        $inRefund = $this->createInvoice(
-            transfer: $transfer,
-            moveType: MoveType::IN_REFUND,
-            branch: $transfer->sourceBranch,
-            partner: $transfer->destinationBranch->partner,
-            journal: $journals['ITRP'],
-            lines: $shippedLines->map(fn (BranchTransferSaleLine $line) => [
-                'name'       => $line->product?->name ?? "Product #{$line->product_id}",
-                'quantity'   => (float) $line->quantity_shipped,
-                'price_unit' => (float) $line->transfer_price_unit,
-                'uom_id'     => $line->product?->uom_id,
-                'account_id' => $accounts[self::STOCK_CODE]->getKey(),
-            ])->all(),
-            date: $date,
-            dueDate: $dueDate,
-        );
+        // Entry 1 (return ship): in_refund at the agreed credit value —
+        // for an unsold return that is P; for a damaged return it is V,
+        // so the Sub's payable falls only by V. When V is 0 there is
+        // nothing to refund and the document is skipped entirely.
+        $inRefund = null;
 
-        $transfer->forceFill(['in_invoice_id' => $inRefund->getKey()])->save();
+        if (! $isDamaged || $totalCredit > 0) {
+            $inRefund = $this->createInvoice(
+                transfer: $transfer,
+                moveType: MoveType::IN_REFUND,
+                branch: $transfer->sourceBranch,
+                partner: $transfer->destinationBranch->partner,
+                journal: $journals['ITRP'],
+                lines: $shippedLines->map(fn (BranchTransferSaleLine $line) => [
+                    'name'       => $line->product?->name ?? "Product #{$line->product_id}",
+                    'quantity'   => (float) $line->quantity_shipped,
+                    'price_unit' => $creditUnit($line),
+                    'uom_id'     => $line->product?->uom_id,
+                    'account_id' => $accounts[self::STOCK_CODE]->getKey(),
+                ])->all(),
+                date: $date,
+                dueDate: $dueDate,
+            );
+
+            $transfer->forceFill(['in_invoice_id' => $inRefund->getKey()])->save();
+        }
 
         // Entry 2 (return ship): COGS reversal at C.
         if ($transfer->type !== TransferType::Service && $totalC > 0) {
@@ -313,11 +344,32 @@ class InterBranchAccountingService
             $transfer->forceFill(['cogs_move_id' => $cogs->getKey()])->save();
         }
 
+        // Entry 3 (damaged return ship): the Sub absorbs (P − V).
+        // The in_refund already credited Stock by V; the rest of the
+        // stock value leaves against Inventory Damage Loss:
+        //   Dr 644000 (P−V) / Cr 110100 (P−V)
+        if ($isDamaged && $totalLoss > 0) {
+            $this->createEntry(
+                transfer: $transfer,
+                branch: $transfer->sourceBranch,
+                partner: $transfer->destinationBranch->partner,
+                journal: $journals['ITR'],
+                lines: [
+                    ['account_id' => $accounts[self::DAMAGE_LOSS_CODE]->getKey(), 'debit' => $totalLoss, 'credit' => 0, 'name' => "Damage loss {$transfer->name}"],
+                    ['account_id' => $accounts[self::STOCK_CODE]->getKey(), 'debit' => 0, 'credit' => $totalLoss, 'name' => "Damaged stock {$transfer->name}"],
+                ],
+                date: $date,
+                reference: "Damage loss {$transfer->name}",
+            );
+        }
+
         $parent = $transfer->parentTransfer;
 
-        if ($parent) {
-            $parent->loadMissing('inInvoice');
-            $this->reconcileRefundAgainstParent($inRefund, $parent->inInvoice, self::PAYABLE_CODE);
+        if ($parent && $inRefund) {
+            // A parent received in several calls has one in_invoice
+            // per receipt: the refund must reconcile against all of
+            // them, oldest first (same Phase 5 fix as payments).
+            $this->reconcileRefundAcrossReceipts($inRefund, $parent, self::PAYABLE_CODE);
             $this->recomputeTransferPayment($parent);
         }
     }
@@ -341,7 +393,7 @@ class InterBranchAccountingService
      */
     public function postReceiptEntries(BranchTransferSale $transfer, array $receivedQuantities): void
     {
-        $transfer->loadMissing(['sourceBranch', 'destinationBranch', 'lines.product']);
+        $transfer->loadMissing(['sourceBranch', 'destinationBranch', 'lines.product', 'parentTransfer.lines']);
 
         $receivedQuantities = array_filter($receivedQuantities, fn ($qty) => (float) $qty > 0);
 
@@ -358,17 +410,24 @@ class InterBranchAccountingService
 
         $lines = $transfer->lines
             ->filter(fn (BranchTransferSaleLine $line) => isset($receivedQuantities[$line->getKey()]))
-            ->map(fn (BranchTransferSaleLine $line) => [
-                'name'       => $line->product?->name ?? "Product #{$line->product_id}",
-                'quantity'   => (float) $receivedQuantities[$line->getKey()],
-                'price_unit' => (float) $line->transfer_price_unit,
-                'uom_id'     => $line->product?->uom_id,
-                // Forward receipt: goods into stock (110100). Return
-                // receipt: revenue reversal (400100) via out_refund.
-                'account_id' => $transfer->type === TransferType::Return
-                    ? $accounts[self::SALES_CODE]->getKey()
-                    : $accounts[self::STOCK_CODE]->getKey(),
-            ])->all();
+            ->map(function (BranchTransferSaleLine $line) use ($transfer, $receivedQuantities, $accounts) {
+                // A damaged return refunds only the agreed credit value V.
+                $priceUnit = $transfer->return_reason === 'damaged'
+                    ? (float) ($line->credit_value_unit ?? $line->transfer_price_unit)
+                    : (float) $line->transfer_price_unit;
+
+                return [
+                    'name'       => $line->product?->name ?? "Product #{$line->product_id}",
+                    'quantity'   => (float) $receivedQuantities[$line->getKey()],
+                    'price_unit' => $priceUnit,
+                    'uom_id'     => $line->product?->uom_id,
+                    // Forward receipt: goods into stock (110100). Return
+                    // receipt: revenue reversal (400100) via out_refund.
+                    'account_id' => $transfer->type === TransferType::Return
+                        ? $accounts[self::SALES_CODE]->getKey()
+                        : $accounts[self::STOCK_CODE]->getKey(),
+                ];
+            })->all();
 
         if ($transfer->type === TransferType::Return) {
             // Return receive: Main posts an out_refund at P, which
@@ -395,6 +454,18 @@ class InterBranchAccountingService
                 $this->recomputeTransferPayment($parent);
             }
 
+            // Damaged return receipt: the COGS reversal at ship put the
+            // goods back into Main's stock at original cost C, but the
+            // damaged goods are only worth the agreed credit V. Adjust
+            // stock from C to V, with the difference on COGS:
+            //   Dr 110100 V / Cr 110100 C / Dr 500100 (C−V)
+            // (or Cr 500100 (V−C) when the credit exceeds the cost).
+            // Main keeps its original margin (P−C); the value
+            // destruction (C−V) is already inside the Sub's loss.
+            if ($transfer->return_reason === 'damaged') {
+                $this->postDamagedReceiptAdjustment($transfer, $receivedQuantities, $accounts, $journals['ITR']);
+            }
+
             return;
         }
 
@@ -417,6 +488,310 @@ class InterBranchAccountingService
     }
 
     /**
+     * Scrap-value adjustment for a damaged return receipt.
+     *
+     * @param  array<int, float>  $receivedQuantities  [line_id => quantity received in this call]
+     */
+    protected function postDamagedReceiptAdjustment(BranchTransferSale $transfer, array $receivedQuantities, array $accounts, Journal $journal): void
+    {
+        $totalV = 0.0;
+        $totalC = 0.0;
+
+        foreach ($transfer->lines as $line) {
+            if (! isset($receivedQuantities[$line->getKey()])) {
+                continue;
+            }
+
+            $qty = (float) $receivedQuantities[$line->getKey()];
+
+            $totalV += round($qty * (float) ($line->credit_value_unit ?? $line->transfer_price_unit), 4);
+
+            $originalLine = $transfer->parentTransfer?->lines
+                ->firstWhere('product_id', $line->product_id);
+
+            $totalC += round($qty * (float) ($originalLine?->cost_price_unit ?? $line->cost_price_unit), 4);
+        }
+
+        if ($totalV == 0.0 && $totalC == 0.0) {
+            return;
+        }
+
+        $lines = [
+            ['account_id' => $accounts[self::STOCK_CODE]->getKey(), 'debit' => $totalV, 'credit' => 0, 'name' => "Damaged stock at scrap value {$transfer->name}"],
+            ['account_id' => $accounts[self::STOCK_CODE]->getKey(), 'debit' => 0, 'credit' => $totalC, 'name' => "Damaged stock at cost {$transfer->name}"],
+        ];
+
+        $difference = round($totalC - $totalV, 4);
+
+        if ($difference > 0) {
+            $lines[] = ['account_id' => $accounts[self::COGS_CODE]->getKey(), 'debit' => $difference, 'credit' => 0, 'name' => "Damage value loss {$transfer->name}"];
+        } elseif ($difference < 0) {
+            $lines[] = ['account_id' => $accounts[self::COGS_CODE]->getKey(), 'debit' => 0, 'credit' => -$difference, 'name' => "Damage value gain {$transfer->name}"];
+        }
+
+        $this->createEntry(
+            transfer: $transfer,
+            branch: $transfer->destinationBranch,
+            partner: $transfer->sourceBranch->partner,
+            journal: $journal,
+            lines: $lines,
+            date: now()->format('Y-m-d'),
+            reference: "Scrap value {$transfer->name}",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Lost / missing write-offs (addendum A3, Phase 5)
+    // -----------------------------------------------------------------
+
+    /**
+     * Post a lost / missing write-off (plan addendum A3).
+     *
+     * The Sub still owes Main — the payable does NOT fall. The loss
+     * is posted at stock value P on the Sub:
+     *   Dr 645000 P / Cr 110100 P
+     * Stock already left the Sub's quants via the engine Scrap record;
+     * this entry is the ledger side of the same loss.
+     */
+    public function postWriteOffEntries(BranchStockWriteOff $writeOff): void
+    {
+        $writeOff->loadMissing(['branch', 'lines']);
+
+        if ($writeOff->account_move_id) {
+            return;
+        }
+
+        $total = (float) $writeOff->lines->sum('loss_subtotal');
+
+        if ($total <= 0) {
+            return;
+        }
+
+        $setup = $this->ensureSetup($writeOff->company_id);
+        $accounts = $setup['accounts'];
+
+        $main = Branch::withoutGlobalScopes()
+            ->where('company_id', $writeOff->company_id)
+            ->where('type', BranchType::Main)
+            ->first();
+
+        $move = $this->createWriteOffEntry(
+            writeOff: $writeOff,
+            branch: $writeOff->branch,
+            partner: $main?->partner,
+            journal: $setup['journals']['ITR'],
+            lines: [
+                ['account_id' => $accounts[self::LOSS_SHORTAGE_CODE]->getKey(), 'debit' => $total, 'credit' => 0, 'name' => "Stock loss {$writeOff->name}"],
+                ['account_id' => $accounts[self::STOCK_CODE]->getKey(), 'debit' => 0, 'credit' => $total, 'name' => "Lost stock {$writeOff->name}"],
+            ],
+            date: now()->format('Y-m-d'),
+            reference: "Stock write-off {$writeOff->name}",
+        );
+
+        $writeOff->forceFill(['account_move_id' => $move->getKey()])->save();
+    }
+
+    /**
+     * Post Main's formal forgiveness of a write-off (addendum A3).
+     *
+     * Two mirrored REFUND invoices, like a payment: the Sub's
+     * payable falls and its loss reverses, while Main's receivable
+     * falls and Main absorbs the loss:
+     *   Sub in_refund:  Dr 211500 P / Cr 645000 P
+     *   Main out_refund: Dr 645000 P / Cr 121500 P
+     * Refund invoices (not plain ENTRYs) so the engine creates
+     * payment-term lines and the refunds reconcile against the
+     * parent transfer's invoices — the residuals, and therefore
+     * the Branch Profile balances, fall by the forgiven amount.
+     * The Main leg is stored on the write-off.
+     */
+    public function postWriteOffForgivenessEntries(BranchStockWriteOff $writeOff): void
+    {
+        $writeOff->loadMissing(['branch', 'lines', 'transfer']);
+
+        if ($writeOff->forgiveness_move_id) {
+            return;
+        }
+
+        $total = (float) $writeOff->lines->sum('loss_subtotal');
+
+        if ($total <= 0) {
+            return;
+        }
+
+        $setup = $this->ensureSetup($writeOff->company_id);
+        $accounts = $setup['accounts'];
+
+        $main = Branch::withoutGlobalScopes()
+            ->where('company_id', $writeOff->company_id)
+            ->where('type', BranchType::Main)
+            ->first();
+
+        if (! $main) {
+            throw new InvalidArgumentException('No Main branch found for this company.');
+        }
+
+        $parent = $writeOff->transfer;
+
+        if (! $parent) {
+            throw new InvalidArgumentException("Write-off {$writeOff->name} has no transfer to forgive against.");
+        }
+
+        $date = now()->format('Y-m-d');
+
+        $subLeg = $this->createForgivenessInvoice(
+            writeOff: $writeOff,
+            parent: $parent,
+            moveType: MoveType::IN_REFUND,
+            branch: $writeOff->branch,
+            partner: $main->partner,
+            journal: $setup['journals']['ITRP'],
+            accountId: $accounts[self::LOSS_SHORTAGE_CODE]->getKey(),
+            amount: $total,
+            date: $date,
+        );
+
+        $mainLeg = $this->createForgivenessInvoice(
+            writeOff: $writeOff,
+            parent: $parent,
+            moveType: MoveType::OUT_REFUND,
+            branch: $main,
+            partner: $writeOff->branch->partner,
+            journal: $setup['journals']['ITRS'],
+            accountId: $accounts[self::LOSS_SHORTAGE_CODE]->getKey(),
+            amount: $total,
+            date: $date,
+        );
+
+        $writeOff->forceFill(['forgiveness_move_id' => $mainLeg->getKey()])->save();
+
+        $parent->loadMissing('inInvoice', 'outInvoice');
+        $this->reconcileRefundAgainstParent($subLeg, $parent->inInvoice, self::PAYABLE_CODE);
+        $this->reconcileRefundAgainstParent($mainLeg, $parent->outInvoice, self::RECEIVABLE_CODE);
+        $this->recomputeTransferPayment($parent);
+    }
+
+    /**
+     * Create + post one leg of a forgiveness (mirrors
+     * createInvoice, but the document is a BranchStockWriteOff and
+     * the reference carries the write-off name).
+     */
+    protected function createForgivenessInvoice(BranchStockWriteOff $writeOff, BranchTransferSale $parent, MoveType $moveType, Branch $branch, ?Partner $partner, Journal $journal, int $accountId, float $amount, string $date): Move
+    {
+        $company = $branch->company;
+
+        $move = Move::create([
+            'journal_id'       => $journal->getKey(),
+            'company_id'       => $branch->company_id,
+            'currency_id'      => $company->currency_id,
+            'state'            => MoveState::DRAFT,
+            'move_type'        => $moveType->value,
+            'date'             => $date,
+            'invoice_date'     => $date,
+            'partner_id'       => $partner?->getKey(),
+            'reference'        => "Forgiveness {$writeOff->name}",
+            'invoice_origin'   => $writeOff->name,
+        ]);
+
+        $move->forceFill([
+            'branch_id'               => $branch->getKey(),
+            'is_internal'             => true,
+            'branch_transfer_sale_id' => $parent->getKey(),
+        ])->save();
+
+        MoveLine::create([
+            'move_id'      => $move->getKey(),
+            'company_id'   => $branch->company_id,
+            'currency_id'  => $company->currency_id,
+            'partner_id'   => $partner?->getKey(),
+            'account_id'   => $accountId,
+            'journal_id'   => $journal->getKey(),
+            'display_type' => DisplayType::PRODUCT,
+            'name'         => "Forgiven loss {$writeOff->name}",
+            'quantity'     => 1,
+            'price_unit'   => $amount,
+            'date'         => $date,
+        ]);
+
+        $posted = $this->moveWorkflow->post($move);
+
+        $posted->lines()->update([
+            'branch_id'               => $branch->getKey(),
+            'is_internal'             => true,
+            'branch_transfer_sale_id' => $parent->getKey(),
+        ]);
+
+        return $posted->refresh();
+    }
+
+    /**
+     * Create a general ENTRY Move for a write-off document (mirrors
+     * createEntry, but the document is a BranchStockWriteOff).
+     */
+    protected function createWriteOffEntry(BranchStockWriteOff $writeOff, Branch $branch, ?Partner $partner, Journal $journal, array $lines, string $date, string $reference): Move
+    {
+        $company = $branch->company;
+
+        $move = Move::create([
+            'journal_id'  => $journal->getKey(),
+            'company_id'  => $branch->company_id,
+            'currency_id' => $company->currency_id,
+            'state'       => MoveState::DRAFT,
+            'move_type'   => MoveType::ENTRY->value,
+            'date'        => $date,
+            'partner_id'  => $partner?->getKey(),
+            'reference'   => $reference,
+        ]);
+
+        $move->forceFill([
+            'branch_id'               => $branch->getKey(),
+            'is_internal'             => true,
+            'branch_transfer_sale_id' => $writeOff->transfer_id,
+        ])->save();
+
+        foreach ($lines as $line) {
+            $debit = round((float) $line['debit'], 4);
+            $credit = round((float) $line['credit'], 4);
+
+            // display_type must be set explicitly: the saving hooks
+            // run computeAccountId BEFORE computeDisplayType, so a
+            // line without one falls into the default case and gets
+            // the journal's default account, discarding the explicit
+            // account_id. PRODUCT keeps the explicit account.
+            MoveLine::create([
+                'move_id'                  => $move->getKey(),
+                'company_id'               => $branch->company_id,
+                'currency_id'              => $company->currency_id,
+                'partner_id'               => $partner?->getKey(),
+                'account_id'               => $line['account_id'],
+                'journal_id'               => $journal->getKey(),
+                'display_type'             => DisplayType::PRODUCT,
+                'name'                     => $line['name'],
+                'debit'                    => $debit,
+                'credit'                   => $credit,
+                'balance'                  => round($debit - $credit, 4),
+                'amount_currency'          => round($debit - $credit, 4),
+                'amount_residual'          => round($debit - $credit, 4),
+                'amount_residual_currency' => round($debit - $credit, 4),
+                'date'                     => $date,
+                'branch_id'                => $branch->getKey(),
+                'is_internal'              => true,
+                'branch_transfer_sale_id'  => $writeOff->transfer_id,
+            ]);
+        }
+
+        $posted = $this->moveWorkflow->post($move);
+
+        $posted->lines()->update([
+            'branch_id'               => $branch->getKey(),
+            'is_internal'             => true,
+            'branch_transfer_sale_id' => $writeOff->transfer_id,
+        ]);
+
+        return $posted->refresh();
+    }
+
+    /**
      * Reconcile a refund's payment-term line against the parent
      * invoice's payment-term line on the same account (opposite
      * signs): e.g. return out_refund 121500 vs parent out_invoice
@@ -430,6 +805,50 @@ class InterBranchAccountingService
         }
 
         $this->reconcileMirrorLines($refund, $parentInvoice, $accountCode);
+    }
+
+    /**
+     * Reconcile a return in_refund against every receipt invoice of
+     * its parent, oldest first (Phase 5 fix — same reason as
+     * reconcilePaymentLegAcrossReceipts). The out_refund side needs
+     * no loop: the parent has a single out_invoice.
+     */
+    protected function reconcileRefundAcrossReceipts(Move $refund, BranchTransferSale $parent, string $accountCode): void
+    {
+        $account = Account::withoutGlobalScopes()->where('code', $accountCode)->first();
+
+        if (! $account) {
+            return;
+        }
+
+        $invoices = Move::query()
+            ->where('branch_transfer_sale_id', $parent->getKey())
+            ->where('move_type', MoveType::IN_INVOICE)
+            ->where('state', MoveState::POSTED)
+            ->orderBy('id')
+            ->get();
+
+        foreach ($invoices as $invoice) {
+            $refundLine = $refund->lines()->where('account_id', $account->getKey())
+                ->where('display_type', DisplayType::PAYMENT_TERM)
+                ->first();
+
+            if (! $refundLine) {
+                return;
+            }
+
+            $refundLine->refresh();
+
+            if (abs((float) $refundLine->amount_residual) <= 0.0001) {
+                return;
+            }
+
+            if (abs((float) $invoice->fresh()->amount_residual) <= 0.0001) {
+                continue;
+            }
+
+            $this->reconcileRefundAgainstParent($refund, $invoice, $accountCode);
+        }
     }
 
     /**
@@ -703,14 +1122,19 @@ class InterBranchAccountingService
             ])->save();
 
             // Reconcile each allocation against the two invoices.
+            // A transfer received in several calls has one in_invoice
+            // per receipt (Phase 4): the Sub leg must reconcile
+            // against ALL of them, oldest first, or later receipt
+            // invoices stay open forever and the payable mirror
+            // breaks (found by the Phase 5 UAT: 3+2 receipt, full
+            // payment, second in_invoice still showed 32000 owed).
             foreach ($allocations as $transferId => $allocation) {
                 $transfer = $transfers->get($transferId);
 
-                $this->reconcilePaymentLeg(
+                $this->reconcilePaymentLegAcrossReceipts(
                     $subMove,
-                    $transfer->inInvoice,
+                    $transfer,
                     self::PAYABLE_CODE,
-                    (float) $allocation,
                 );
 
                 $this->reconcilePaymentLeg(
@@ -766,6 +1190,51 @@ class InterBranchAccountingService
         $invoice->refresh();
         $invoice->computePaymentState();
         $invoice->save();
+    }
+
+    /**
+     * Reconcile a payment Sub leg against every receipt invoice of
+     * a transfer, oldest first (Phase 5 fix — see recordPayment).
+     *
+     * Stops when the payment line is fully reconciled, and skips
+     * invoices that are already fully reconciled, so a small
+     * payment never touches a later invoice and a large payment
+     * walks the whole chain.
+     */
+    protected function reconcilePaymentLegAcrossReceipts(Move $paymentMove, BranchTransferSale $transfer, string $accountCode): void
+    {
+        $account = Account::withoutGlobalScopes()->where('code', $accountCode)->first();
+
+        if (! $account) {
+            return;
+        }
+
+        $invoices = Move::query()
+            ->where('branch_transfer_sale_id', $transfer->getKey())
+            ->where('move_type', MoveType::IN_INVOICE)
+            ->where('state', MoveState::POSTED)
+            ->orderBy('id')
+            ->get();
+
+        foreach ($invoices as $invoice) {
+            $paymentLine = $paymentMove->lines()->where('account_id', $account->getKey())->first();
+
+            if (! $paymentLine) {
+                return;
+            }
+
+            $paymentLine->refresh();
+
+            if (abs((float) $paymentLine->amount_residual) <= 0.0001) {
+                return;
+            }
+
+            if (abs((float) $invoice->fresh()->amount_residual) <= 0.0001) {
+                continue;
+            }
+
+            $this->reconcilePaymentLeg($paymentMove, $invoice, $accountCode, 0.0);
+        }
     }
 
     /**

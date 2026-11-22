@@ -19,6 +19,7 @@ class StockLayerConsumption extends Model
     protected $fillable = [
         'layer_id',
         'transfer_line_id',
+        'write_off_line_id',
         'quantity',
         'unit_cost',
     ];
@@ -36,5 +37,11 @@ class StockLayerConsumption extends Model
     public function transferLine(): BelongsTo
     {
         return $this->belongsTo(BranchTransferSaleLine::class, 'transfer_line_id');
+    }
+
+    /** The write-off line that consumed this layer (lost stock). */
+    public function writeOffLine(): BelongsTo
+    {
+        return $this->belongsTo(BranchStockWriteOffLine::class, 'write_off_line_id');
     }
 }

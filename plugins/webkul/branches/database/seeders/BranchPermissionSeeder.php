@@ -39,6 +39,14 @@ class BranchPermissionSeeder extends Seeder
         'receive_transfer',
         'cancel_transfer',
         'return_transfer',
+        'close_short_transfer',
+        'report_lost_stock',
+        'view_stock_write_off',
+        'create_stock_write_off',
+        'approve_stock_write_off',
+        'post_stock_write_off',
+        'forgive_stock_write_off',
+        'view_any_branch_stock_write_off',
         'record_inter_branch_payment',
         'approve_transfer',
         'view_any_branch_transfer_sale',
@@ -47,6 +55,8 @@ class BranchPermissionSeeder extends Seeder
         'edit_transfer_price_rule',
         'delete_transfer_price_rule',
         'view_any_branch_transfer_price_rule',
+        'view_stock_layer',
+        'view_any_branch_stock_layer',
     ];
 
     /**

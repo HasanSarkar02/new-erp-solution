@@ -15,6 +15,7 @@ class DatabaseSeeder extends Seeder
             BranchPermissionSeeder::class,
             DemoBranchSeeder::class,
             InternalAccountsSeeder::class,
+            DemoTransfersSeeder::class,
         ]);
     }
 }

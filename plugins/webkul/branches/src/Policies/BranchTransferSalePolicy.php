@@ -80,6 +80,35 @@ class BranchTransferSalePolicy
             && ($user->can('view_all_branches') || $this->isAssigned($user, (int) $transfer->destination_branch_id));
     }
 
+    /**
+     * Damaged return (Phase 5): the same actors as an unsold return
+     * may raise it; Main sets the agreed credit value.
+     */
+    public function returnDamaged(User $user, BranchTransferSale $transfer): bool
+    {
+        return $this->return($user, $transfer);
+    }
+
+    /**
+     * Close the unshipped remainder (Phase 5): Main / head office,
+     * or the source branch that did the shipping.
+     */
+    public function closeShort(User $user, BranchTransferSale $transfer): bool
+    {
+        return $user->can('close_short_transfer') && $this->canActForSource($user, $transfer);
+    }
+
+    /**
+     * Report lost / missing stock (Phase 5): the destination branch
+     * that received the goods raises the write-off; Main approves,
+     * posts and forgives it (see BranchStockWriteOffPolicy).
+     */
+    public function reportLost(User $user, BranchTransferSale $transfer): bool
+    {
+        return $user->can('report_lost_stock')
+            && ($user->can('view_all_branches') || $this->isAssigned($user, (int) $transfer->destination_branch_id));
+    }
+
     public function approve(User $user, BranchTransferSale $transfer): bool
     {
         return $user->can('view_all_branches') && $transfer->requiresMainApproval();

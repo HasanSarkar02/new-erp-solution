@@ -21,6 +21,7 @@ class BranchTransferSaleLine extends Model
         'quantity_returned',
         'uom_id',
         'transfer_price_unit',
+        'credit_value_unit',
         'cost_price_unit',
         'price_subtotal',
         'cost_subtotal',
@@ -34,6 +35,7 @@ class BranchTransferSaleLine extends Model
         'quantity_received'   => 'decimal:4',
         'quantity_returned'   => 'decimal:4',
         'transfer_price_unit' => 'decimal:4',
+        'credit_value_unit'   => 'decimal:4',
         'cost_price_unit'     => 'decimal:4',
         'price_subtotal'      => 'decimal:4',
         'cost_subtotal'       => 'decimal:4',
@@ -66,6 +68,12 @@ class BranchTransferSaleLine extends Model
     public function consumptions(): HasMany
     {
         return $this->hasMany(StockLayerConsumption::class, 'transfer_line_id');
+    }
+
+    /** Lost / missing write-off lines raised against this line. */
+    public function writeOffLines(): HasMany
+    {
+        return $this->hasMany(BranchStockWriteOffLine::class, 'transfer_line_id');
     }
 
     /**

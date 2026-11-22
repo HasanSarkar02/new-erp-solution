@@ -13,6 +13,7 @@ use Illuminate\Support\Facades\Gate;
 use Webkul\Branch\Enums\TransferStatus;
 use Webkul\Branch\Models\BranchTransferSale;
 use Webkul\Branch\Services\BranchTransferService;
+use Webkul\Branch\Services\BranchWriteOffService;
 use Webkul\Branch\Services\InterBranchAccountingService;
 
 /**
@@ -33,9 +34,12 @@ class TransferActions
             static::confirmAction(),
             static::shipAction(),
             static::receiveAction(),
+            static::closeShortAction(),
             static::recordPaymentAction(),
             static::cancelAction(),
             static::returnAction(),
+            static::returnDamagedAction(),
+            static::reportLostAction(),
         ];
     }
 
@@ -210,6 +214,31 @@ class TransferActions
             });
     }
 
+    /**
+     * Close the unshipped remainder (Phase 5). Only offered while
+     * some ordered units were never shipped.
+     */
+    protected static function closeShortAction(): Action
+    {
+        return Action::make('closeShort')
+            ->label('Close short')
+            ->icon('heroicon-o-scissors')
+            ->color('gray')
+            ->visible(fn (BranchTransferSale $record) => in_array($record->status, [TransferStatus::InTransit, TransferStatus::PartiallyReceived], true)
+                && ! $record->is_closed_short
+                && $record->lines->contains(fn ($line) => (float) $line->quantity > (float) $line->quantity_shipped))
+            ->authorize(fn (BranchTransferSale $record) => Gate::allows('closeShort', $record))
+            ->form([
+                Textarea::make('note')->label('Note (recorded in history)')->rows(2),
+            ])
+            ->requiresConfirmation()
+            ->action(function (BranchTransferSale $record, array $data) {
+                app(BranchTransferService::class)->closeShort($record, null, $data['note'] ?? null);
+
+                Notification::make()->title('Unshipped remainder closed. The shipped part still needs to be received.')->success()->send();
+            });
+    }
+
     protected static function cancelAction(): Action
     {
         return Action::make('cancel')
@@ -269,6 +298,129 @@ class TransferActions
                 app(BranchTransferService::class)->return($record, null, $quantities);
 
                 Notification::make()->title('Return transfer created (draft).')->success()->send();
+            });
+    }
+
+    /**
+     * Return DAMAGED goods (Phase 5, addendum A3): the Sub's payable
+     * falls only by the agreed credit value per unit; the difference
+     * is the Sub's Inventory Damage Loss. The goods go to Main's
+     * Scrap location on receipt.
+     */
+    protected static function returnDamagedAction(): Action
+    {
+        return Action::make('returnDamaged')
+            ->label('Return damaged')
+            ->icon('heroicon-o-exclamation-triangle')
+            ->color('danger')
+            ->visible(fn (BranchTransferSale $record) => in_array($record->status, [TransferStatus::Received, TransferStatus::PartiallyReceived], true))
+            ->authorize(fn (BranchTransferSale $record) => Gate::allows('returnDamaged', $record))
+            ->form(fn (BranchTransferSale $record) => [
+                Repeater::make('return_lines')
+                    ->label('Damaged return — agreed credit per unit (0 = no credit, Sub bears the full loss)')
+                    ->schema([
+                        Select::make('line_id')
+                            ->label('Line')
+                            ->options($record->lines->mapWithKeys(fn ($line) => [
+                                $line->getKey() => $line->product->name.' — received '.$line->quantity_received.' @ '.$line->transfer_price_unit,
+                            ])->all())
+                            ->required()
+                            ->disabled()
+                            ->dehydrated(true),
+                        TextInput::make('quantity')
+                            ->label('Return qty')
+                            ->numeric()
+                            ->required()
+                            ->minValue(0),
+                        TextInput::make('credit_value_unit')
+                            ->label('Agreed credit / unit')
+                            ->numeric()
+                            ->required()
+                            ->minValue(0),
+                    ])
+                    ->columns(3)
+                    ->default($record->lines->map(fn ($line) => [
+                        'line_id'           => $line->getKey(),
+                        'quantity'          => (float) $line->quantity_received - (float) $line->quantity_returned,
+                        'credit_value_unit' => (float) $line->transfer_price_unit,
+                    ])->all())
+                    ->reorderable(false),
+            ])
+            ->action(function (BranchTransferSale $record, array $data) {
+                $quantities = collect($data['return_lines'] ?? [])
+                    ->mapWithKeys(fn (array $row) => [(int) $row['line_id'] => (float) $row['quantity']])
+                    ->all();
+
+                $credits = collect($data['return_lines'] ?? [])
+                    ->mapWithKeys(fn (array $row) => [(int) $row['line_id'] => (float) $row['credit_value_unit']])
+                    ->all();
+
+                app(BranchTransferService::class)->returnDamaged($record, null, $quantities, $credits);
+
+                Notification::make()->title('Damaged return transfer created (draft). Goods go to Scrap on receipt.')->success()->send();
+            });
+    }
+
+    /**
+     * Report lost / missing stock (Phase 5, addendum A3): creates a
+     * draft write-off against this transfer. Main approves, posts
+     * and (optionally) forgives it from the write-off list.
+     */
+    protected static function reportLostAction(): Action
+    {
+        return Action::make('reportLost')
+            ->label('Report lost stock')
+            ->icon('heroicon-o-magnifying-glass')
+            ->color('danger')
+            ->visible(fn (BranchTransferSale $record) => in_array($record->status, [TransferStatus::Received, TransferStatus::PartiallyReceived], true))
+            ->authorize(fn (BranchTransferSale $record) => Gate::allows('reportLost', $record))
+            ->form(fn (BranchTransferSale $record) => [
+                Repeater::make('lost_lines')
+                    ->label('Lost / missing quantities')
+                    ->schema([
+                        Select::make('line_id')
+                            ->label('Line')
+                            ->options($record->lines->mapWithKeys(fn ($line) => [
+                                $line->getKey() => $line->product->name.' — received '.$line->quantity_received,
+                            ])->all())
+                            ->required()
+                            ->disabled()
+                            ->dehydrated(true),
+                        TextInput::make('quantity')
+                            ->label('Lost qty')
+                            ->numeric()
+                            ->required()
+                            ->minValue(0),
+                    ])
+                    ->columns(2)
+                    ->default($record->lines->map(fn ($line) => [
+                        'line_id'  => $line->getKey(),
+                        'quantity' => 0,
+                    ])->all())
+                    ->reorderable(false),
+                Textarea::make('investigation_note')
+                    ->label('Investigation note — what happened, when, who checked')
+                    ->required()
+                    ->rows(3),
+            ])
+            ->action(function (BranchTransferSale $record, array $data) {
+                $lines = collect($data['lost_lines'] ?? [])
+                    ->filter(fn (array $row) => (float) $row['quantity'] > 0)
+                    ->map(fn (array $row) => [
+                        'product_id' => (int) $record->lines->firstWhere('id', (int) $row['line_id'])->product_id,
+                        'quantity'   => (float) $row['quantity'],
+                    ])
+                    ->values()
+                    ->all();
+
+                $writeOff = app(BranchWriteOffService::class)->create(
+                    $record->destinationBranch,
+                    $record,
+                    $lines,
+                    $data['investigation_note'],
+                );
+
+                Notification::make()->title("Write-off {$writeOff->name} created (draft). Main must approve and post it.")->success()->send();
             });
     }
 }

@@ -8,13 +8,16 @@ use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Schema;
 use Webkul\Branch\Console\Commands\CheckBalancesCommand;
 use Webkul\Branch\Models\Branch;
+use Webkul\Branch\Models\BranchStockWriteOff;
 use Webkul\Branch\Models\BranchTransferSale;
 use Webkul\Branch\Policies\BranchPolicy;
+use Webkul\Branch\Policies\BranchStockWriteOffPolicy;
 use Webkul\Branch\Policies\BranchTransferSalePolicy;
 use Webkul\Branch\Services\BranchBalanceService;
 use Webkul\Branch\Services\BranchService;
 use Webkul\Branch\Services\BranchTransferPriceService;
 use Webkul\Branch\Services\BranchTransferService;
+use Webkul\Branch\Services\BranchWriteOffService;
 use Webkul\Branch\Services\InterBranchAccountingService;
 use Webkul\Branch\Services\StockLayerService;
 use Webkul\Branch\Services\TransferStockService;
@@ -32,6 +35,7 @@ class BranchServiceProvider extends PackageServiceProvider
     public function configureCustomPackage(Package $package): void
     {
         $package->name(static::$name)
+            ->hasViews()
             ->hasMigrations([
                 '2026_11_21_100001_create_branches_table',
                 '2026_11_21_100002_create_branch_user_table',
@@ -50,6 +54,8 @@ class BranchServiceProvider extends PackageServiceProvider
                 '2026_11_21_100015_create_inter_branch_payments_table',
                 '2026_11_21_100016_create_inter_branch_payment_allocations_table',
                 '2026_11_21_100017_add_cogs_move_and_payment_state_to_branch_transfer_sales',
+                '2026_11_22_100018_add_return_reason_and_close_short',
+                '2026_11_22_100019_create_branch_stock_write_offs_table',
             ])
             ->hasCommands([
                 CheckBalancesCommand::class,
@@ -104,6 +110,7 @@ class BranchServiceProvider extends PackageServiceProvider
 
         Gate::policy(Branch::class, BranchPolicy::class);
         Gate::policy(BranchTransferSale::class, BranchTransferSalePolicy::class);
+        Gate::policy(BranchStockWriteOff::class, BranchStockWriteOffPolicy::class);
     }
 
     public function packageRegistered(): void
@@ -119,5 +126,6 @@ class BranchServiceProvider extends PackageServiceProvider
         $this->app->singleton(InterBranchAccountingService::class);
         $this->app->singleton(BranchBalanceService::class);
         $this->app->singleton(BranchTransferService::class);
+        $this->app->singleton(BranchWriteOffService::class);
     }
 }

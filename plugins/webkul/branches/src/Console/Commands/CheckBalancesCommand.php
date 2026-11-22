@@ -8,6 +8,7 @@ use Webkul\Account\Enums\MoveState;
 use Webkul\Account\Enums\MoveType;
 use Webkul\Account\Models\Move;
 use Webkul\Branch\Enums\TransferStatus;
+use Webkul\Branch\Enums\TransferType;
 use Webkul\Branch\Models\Branch;
 use Webkul\Branch\Models\BranchTransferSale;
 use Webkul\Support\Models\Company;
@@ -48,6 +49,41 @@ class CheckBalancesCommand extends Command
             // show shipped quantities, so it must not count as
             // in-transit stock.
             if ($transfer->status === TransferStatus::Cancelled) {
+                continue;
+            }
+
+            // A return transfer is a mirror of the normal flow: its
+            // out_refund residual (Main owes the Sub) must equal its
+            // in_refund residual (the Sub's credit). The normal
+            // out_invoice − in_invoice formula does not apply — the
+            // return has no invoices, only refunds. (Phase 5 fix:
+            // the UAT return after full payment tripped this check.)
+            if ($transfer->type === TransferType::Return) {
+                $outRefund = (float) Move::query()
+                    ->where('is_internal', true)
+                    ->where('state', MoveState::POSTED)
+                    ->where('move_type', MoveType::OUT_REFUND)
+                    ->where('branch_transfer_sale_id', $transfer->getKey())
+                    ->sum('amount_residual');
+
+                $inRefund = (float) Move::query()
+                    ->where('is_internal', true)
+                    ->where('state', MoveState::POSTED)
+                    ->where('move_type', MoveType::IN_REFUND)
+                    ->where('branch_transfer_sale_id', $transfer->getKey())
+                    ->sum('amount_residual');
+
+                if (abs($outRefund - $inRefund) > 0.0001) {
+                    $mismatches[] = sprintf(
+                        '%s (%s → %s, return): out_refund residual %.4f != in_refund residual %.4f',
+                        $transfer->name,
+                        $transfer->sourceBranch?->code,
+                        $transfer->destinationBranch?->code,
+                        $outRefund,
+                        $inRefund,
+                    );
+                }
+
                 continue;
             }
 

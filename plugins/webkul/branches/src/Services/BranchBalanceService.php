@@ -16,63 +16,92 @@ use Webkul\Branch\Models\Branch;
  * stored balance field. Receivable = what Sub branches owe Main
  * (posted internal out_invoices, partner = the Sub); payable =
  * what Main owes a Sub on returns (posted internal in_invoices).
+ *
+ * Open refunds are netted (Phase 5): a return posted after the
+ * parent was fully paid leaves the refunds open — the Sub is owed
+ * the money back — so the headline balances subtract open
+ * out_refund / in_refund residuals. Fully reconciled refunds have
+ * residual 0 and change nothing.
  */
 class BranchBalanceService
 {
     /**
      * Outstanding receivable for one Sub branch: Main's posted
-     * internal out_invoices to that Sub's partner, residual sum.
+     * internal out_invoices to that Sub's partner, residual sum,
+     * less open out_refunds (returns not yet settled in cash).
      */
     public function receivableOutstanding(Branch $branch): float
     {
         if ($branch->is_main) {
-            return (float) Move::query()
-                ->where('is_internal', true)
-                ->where('state', MoveState::POSTED)
-                ->where('move_type', MoveType::OUT_INVOICE)
-                ->whereNotNull('branch_transfer_sale_id')
-                ->sum('amount_residual');
+            return round(
+                $this->residualSum(MoveType::OUT_INVOICE, null, null)
+                - $this->residualSum(MoveType::OUT_REFUND, null, null),
+                4
+            );
         }
 
         if (! $branch->partner_id) {
             return 0.0;
         }
 
-        return (float) Move::query()
-            ->where('is_internal', true)
-            ->where('state', MoveState::POSTED)
-            ->where('move_type', MoveType::OUT_INVOICE)
-            ->where('partner_id', $branch->partner_id)
-            ->sum('amount_residual');
+        return round(
+            $this->residualSum(MoveType::OUT_INVOICE, $branch->partner_id, null)
+            - $this->residualSum(MoveType::OUT_REFUND, $branch->partner_id, null),
+            4
+        );
     }
 
     /**
      * Outstanding payable for one Sub branch: posted internal
-     * in_invoices on that branch (partner = Main), residual sum.
+     * in_invoices on that branch (partner = Main), residual sum,
+     * less open in_refunds (returns not yet settled in cash).
      * Move residuals are positive for both invoice directions — the
      * signed balance lives on the payment-term line, not the Move.
      */
     public function payableOutstanding(Branch $branch): float
     {
         if ($branch->is_main) {
-            return (float) Move::query()
-                ->where('is_internal', true)
-                ->where('state', MoveState::POSTED)
-                ->where('move_type', MoveType::IN_INVOICE)
-                ->whereNotNull('branch_transfer_sale_id')
-                ->sum('amount_residual');
+            return round(
+                $this->residualSum(MoveType::IN_INVOICE, null, null)
+                - $this->residualSum(MoveType::IN_REFUND, null, null),
+                4
+            );
         }
 
         if (! $branch->partner_id) {
             return 0.0;
         }
 
-        return (float) Move::query()
+        return round(
+            $this->residualSum(MoveType::IN_INVOICE, null, $branch->getKey())
+            - $this->residualSum(MoveType::IN_REFUND, null, $branch->getKey()),
+            4
+        );
+    }
+
+    /**
+     * Sum of amount_residual for posted internal Moves of one type.
+     * Partner-scoped for receivable (partner = the Sub), branch-
+     * scoped for payable (branch = the Sub); Main totals cover all
+     * internal transfers.
+     */
+    protected function residualSum(MoveType $moveType, ?int $partnerId, ?int $branchId): float
+    {
+        $query = Move::query()
             ->where('is_internal', true)
             ->where('state', MoveState::POSTED)
-            ->where('move_type', MoveType::IN_INVOICE)
-            ->where('branch_id', $branch->getKey())
-            ->sum('amount_residual');
+            ->where('move_type', $moveType)
+            ->whereNotNull('branch_transfer_sale_id');
+
+        if ($partnerId !== null) {
+            $query->where('partner_id', $partnerId);
+        }
+
+        if ($branchId !== null) {
+            $query->where('branch_id', $branchId);
+        }
+
+        return (float) $query->sum('amount_residual');
     }
 
     /** Net position of a Sub branch: receivable minus payable. */

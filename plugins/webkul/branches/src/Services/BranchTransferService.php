@@ -125,6 +125,7 @@ class BranchTransferService
                 'name'                     => $this->generateNumber($companyId, $transferDate),
                 'reference'                => $data['reference'] ?? null,
                 'type'                     => $type->value,
+                'return_reason'            => $data['return_reason'] ?? ($type === TransferType::Return ? 'unsold' : null),
                 'status'                   => TransferStatus::Draft->value,
                 'transfer_date'            => $transferDate->toDateString(),
                 'expected_date'            => $data['expected_date'] ?? null,
@@ -151,6 +152,9 @@ class BranchTransferService
                     'quantity'            => (float) $lineData['quantity'],
                     'uom_id'              => $product->uom_id,
                     'transfer_price_unit' => $price,
+                    'credit_value_unit'   => isset($lineData['credit_value_unit']) && $lineData['credit_value_unit'] !== ''
+                        ? (float) $lineData['credit_value_unit']
+                        : null,
                     'price_subtotal'      => (float) $lineData['quantity'] * $price,
                     'sort'                => $sort++,
                 ]);
@@ -342,7 +346,16 @@ class BranchTransferService
             $transfer->refresh();
 
             if ($this->stockService->movesStock($transfer) && $transfer->destination_warehouse_id) {
-                $this->stockService->createReceiptOperation($transfer->refresh(), $receivedThisCall);
+                // A damaged return goes to Main's Scrap location after
+                // Main's inspection, never into sellable stock.
+                $destinationLocation = null;
+
+                if ($transfer->type === TransferType::Return && $transfer->return_reason === 'damaged') {
+                    $destinationBranch = Branch::withoutGlobalScopes()->findOrFail($transfer->destination_branch_id);
+                    $destinationLocation = $this->stockService->scrapLocation($destinationBranch);
+                }
+
+                $this->stockService->createReceiptOperation($transfer->refresh(), $receivedThisCall, $destinationLocation);
             }
 
             // Phase 4: post Entry 3 (in_invoice at P) for the
@@ -414,8 +427,7 @@ class BranchTransferService
 
     /**
      * Return goods to the source branch (addendum A3: unsold return at
-     * the original P; damaged / lost flows are separate documents in
-     * Phase 4/5 — this method only builds the unsold-return document).
+     * the original P; use returnDamaged() for a damaged return).
      *
      * Creates a linked return transfer (type return, branches swapped,
      * lines at the original transfer price) in draft, and marks the
@@ -425,9 +437,38 @@ class BranchTransferService
      */
     public function return(BranchTransferSale $transfer, ?User $actor = null, array $returnQuantities = []): BranchTransferSale
     {
+        return $this->createReturn($transfer, $actor, $returnQuantities, 'unsold', []);
+    }
+
+    /**
+     * Return DAMAGED goods to Main (addendum A3, Phase 5).
+     *
+     * Same document as an unsold return, but the return_reason is
+     * 'damaged' and each line carries the agreed credit value V
+     * (credit_value_unit). The Sub's payable falls only by V; the
+     * difference (P − V) is the Sub's Inventory Damage Loss. The
+     * goods go to Main's Scrap location on receipt, never into
+     * sellable stock.
+     *
+     * @param  array<int, float>  $returnQuantities  line id => qty to return (default: all received, not yet returned)
+     * @param  array<int, float>  $creditValues  line id => agreed credit per unit (default: full P)
+     */
+    public function returnDamaged(BranchTransferSale $transfer, ?User $actor = null, array $returnQuantities = [], array $creditValues = []): BranchTransferSale
+    {
+        return $this->createReturn($transfer, $actor, $returnQuantities, 'damaged', $creditValues);
+    }
+
+    /**
+     * Build a return transfer document (unsold or damaged).
+     *
+     * @param  array<int, float>  $returnQuantities  line id => qty to return
+     * @param  array<int, float>  $creditValues  line id => agreed credit per unit (damaged only)
+     */
+    protected function createReturn(BranchTransferSale $transfer, ?User $actor, array $returnQuantities, string $reason, array $creditValues): BranchTransferSale
+    {
         $actor ??= Auth::user();
 
-        return DB::transaction(function () use ($transfer, $actor, $returnQuantities) {
+        return DB::transaction(function () use ($transfer, $actor, $returnQuantities, $reason, $creditValues) {
             $transfer = $transfer->fresh();
 
             $this->assertStatus($transfer, [TransferStatus::Received, TransferStatus::PartiallyReceived]);
@@ -445,10 +486,21 @@ class BranchTransferService
                 }
 
                 if ($qty > 0) {
+                    $credit = $reason === 'damaged'
+                        ? (float) ($creditValues[$line->getKey()] ?? $line->transfer_price_unit)
+                        : null;
+
+                    if ($credit !== null && ($credit < 0 || $credit > (float) $line->transfer_price_unit)) {
+                        throw ValidationException::withMessages([
+                            'lines' => "Agreed credit for line {$line->getKey()} must be between 0 and the transfer price.",
+                        ]);
+                    }
+
                     $returnLines[] = [
                         'product_id'          => $line->product_id,
                         'quantity'            => $qty,
                         'transfer_price_unit' => (float) $line->transfer_price_unit,
+                        'credit_value_unit'   => $credit,
                     ];
                 }
             }
@@ -464,10 +516,13 @@ class BranchTransferService
                 'source_branch_id'      => $transfer->destination_branch_id,
                 'destination_branch_id' => $transfer->source_branch_id,
                 'type'                  => TransferType::Return->value,
+                'return_reason'         => $reason,
                 'parent_transfer_id'    => $transfer->getKey(),
                 'reference'             => $transfer->name,
                 'transfer_date'         => now()->toDateString(),
-                'notes'                 => 'Return of '.$transfer->name.' at the original transfer price.',
+                'notes'                 => $reason === 'damaged'
+                    ? 'Damaged return of '.$transfer->name.' at the agreed credit value.'
+                    : 'Return of '.$transfer->name.' at the original transfer price.',
                 'lines'                 => $returnLines,
             ], $actor);
 
@@ -483,10 +538,81 @@ class BranchTransferService
 
             $transfer->refresh();
 
+            $note = $reason === 'damaged'
+                ? 'Damaged goods returned in transfer '.$returnTransfer->name.'.'
+                : 'Goods returned in transfer '.$returnTransfer->name.'.';
+
             if ($transfer->lines->every(fn (BranchTransferSaleLine $line) => (float) $line->quantity_returned >= (float) $line->quantity_received)) {
-                $this->transition($transfer, TransferStatus::Returned, $actor, 'Goods returned in transfer '.$returnTransfer->name.'.');
+                $this->transition($transfer, TransferStatus::Returned, $actor, $note);
             } else {
                 $this->recordHistory($transfer, $transfer->status, $transfer->status, $actor, 'Partial return in transfer '.$returnTransfer->name.'.');
+            }
+
+            return $transfer->refresh();
+        });
+    }
+
+    /**
+     * Close the unshipped remainder of a transfer (Phase 3 gap,
+     * Phase 5). A transfer that was shipped short — ordered 10,
+     * shipped 8 — stays open forever because isFullyReceived()
+     * compares against the ordered quantity. Closing short marks
+     * the unshipped remainder closed with a history entry.
+     *
+     * No stock or accounting effect for the unshipped part: those
+     * units never left the source branch (the outbound move was
+     * resized at ship), so they are simply available again. The
+     * shipped part is untouched — it must still be received (or
+     * cancelled) on its own. When everything shipped has been
+     * received, the transfer becomes Received.
+     */
+    public function closeShort(BranchTransferSale $transfer, ?User $actor = null, ?string $note = null): BranchTransferSale
+    {
+        $actor ??= Auth::user();
+
+        return DB::transaction(function () use ($transfer, $actor, $note) {
+            $transfer = $transfer->fresh();
+
+            $this->assertStatus($transfer, [TransferStatus::InTransit, TransferStatus::PartiallyReceived]);
+
+            if ($transfer->is_closed_short) {
+                throw ValidationException::withMessages([
+                    'status' => "Transfer {$transfer->name} was already closed short.",
+                ]);
+            }
+
+            $shortParts = [];
+
+            foreach ($transfer->lines as $line) {
+                $short = round((float) $line->quantity - (float) $line->quantity_shipped, 4);
+
+                if ($short > 0) {
+                    $shortParts[] = "{$line->product?->name} × {$short}";
+                }
+            }
+
+            if ($shortParts === []) {
+                throw ValidationException::withMessages([
+                    'status' => "Transfer {$transfer->name} has no unshipped remainder to close.",
+                ]);
+            }
+
+            $transfer->forceFill([
+                'is_closed_short' => true,
+                'closed_short_at' => now(),
+            ])->save();
+
+            $message = 'Closed short — unshipped remainder will not be delivered: '.implode(', ', $shortParts).'.';
+
+            if ($note) {
+                $message .= ' '.$note;
+            }
+
+            if ($transfer->refresh()->isFullyReceived()) {
+                $transfer->forceFill(['received_date' => now()])->save();
+                $this->transition($transfer, TransferStatus::Received, $actor, $message);
+            } else {
+                $this->recordHistory($transfer, $transfer->status, $transfer->status, $actor, $message);
             }
 
             return $transfer->refresh();
@@ -695,7 +821,11 @@ class BranchTransferService
         foreach ($lines as $line) {
             $product = Product::query()->findOrFail((int) $line['product_id']);
 
-            if ($product->is_configurable || $product->parent_id) {
+            // A configurable parent has no stock of its own — pick a
+            // variant instead. A variant (parent_id set, not itself
+            // configurable) is a real stockable product and may be
+            // transferred.
+            if ($product->is_configurable) {
                 throw ValidationException::withMessages([
                     'lines' => "Product {$product->name} is a configurable parent — pick a variant instead.",
                 ]);

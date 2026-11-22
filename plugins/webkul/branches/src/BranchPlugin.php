@@ -5,6 +5,7 @@ namespace Webkul\Branch;
 use Filament\Contracts\Plugin;
 use Filament\Navigation\NavigationGroup;
 use Filament\Panel;
+use Webkul\Branch\Filament\Widgets\BranchesOweUsWidget;
 use Webkul\PluginManager\Package;
 
 class BranchPlugin implements Plugin
@@ -49,7 +50,19 @@ class BranchPlugin implements Plugin
                 $panel->discoverResources(
                     in: __DIR__.'/Filament/Resources',
                     for: 'Webkul\\Branch\\Filament\\Resources'
-                );
+                )
+                    ->discoverPages(
+                        in: __DIR__.'/Filament/Pages',
+                        for: 'Webkul\\Branch\\Filament\\Pages'
+                    )
+                    ->discoverWidgets(
+                        in: __DIR__.'/Filament/Widgets',
+                        for: 'Webkul\\Branch\\Filament\\Widgets'
+                    )
+                    // "Branches owe us" on the admin dashboard (Phase 5).
+                    ->widgets([
+                        BranchesOweUsWidget::class,
+                    ]);
             });
     }
 

@@ -9,6 +9,7 @@ use Webkul\Branch\Enums\TransferType;
 use Webkul\Branch\Models\Branch;
 use Webkul\Branch\Models\BranchTransferSale;
 use Webkul\Branch\Models\BranchTransferSaleLine;
+use Webkul\Inventory\Enums\LocationType;
 use Webkul\Inventory\Enums\MoveState;
 use Webkul\Inventory\Enums\OperationState;
 use Webkul\Inventory\Enums\OperationType as OperationTypeEnum;
@@ -147,6 +148,30 @@ class TransferStockService
     }
 
     /**
+     * The warehouse's Scrap location, creating it on first use.
+     *
+     * Damaged returns go straight here after Main's inspection, so
+     * the damaged goods never sit in sellable stock. The engine has
+     * no SCRAP location type; a Scrap location is an inventory
+     * location named "Scrap" under the warehouse's stock location.
+     */
+    public function scrapLocation(Branch $branch): Location
+    {
+        $warehouse = $branch->warehouse ?? throw ValidationException::withMessages([
+            'source_branch_id' => "Branch {$branch->name} has no warehouse.",
+        ]);
+
+        return Location::query()->firstOrCreate([
+            'warehouse_id' => $warehouse->getKey(),
+            'name'         => 'Scrap',
+            'type'         => LocationType::INVENTORY,
+        ], [
+            'parent_id'  => $warehouse->lot_stock_location_id,
+            'company_id' => $warehouse->company_id,
+        ]);
+    }
+
+    /**
      * Create the outbound Operation + Moves for a transfer and
      * reserve the stock at the source branch (plan §9 Phase 3.1).
      * Runs inside the caller's transaction (BranchTransferService).
@@ -266,13 +291,15 @@ class TransferStockService
 
     /**
      * Create and immediately complete the receipt Operation for one
-     * receive call (plan §9 Phase 3.3): Transit → destination Stock.
-     * Creates the destination branch's stock layers at P. Returns
-     * null when nothing was received in this call (no operation).
+     * receive call (plan §9 Phase 3.3): Transit → destination Stock
+     * (or Transit → Scrap for a damaged return). Creates the
+     * destination branch's stock layers at P (at original cost C for
+     * a return receipt). Returns null when nothing was received in
+     * this call (no operation).
      *
      * @param  array<int, float>  $receivedQuantities  line id => received qty this call
      */
-    public function createReceiptOperation(BranchTransferSale $transfer, array $receivedQuantities): ?Operation
+    public function createReceiptOperation(BranchTransferSale $transfer, array $receivedQuantities, ?Location $destinationLocation = null): ?Operation
     {
         $transfer->loadMissing('lines.product');
 
@@ -283,7 +310,7 @@ class TransferStockService
         $source = Branch::withoutGlobalScopes()->findOrFail($transfer->source_branch_id);
         $destination = Branch::withoutGlobalScopes()->findOrFail($transfer->destination_branch_id);
         $destinationWarehouse = Warehouse::query()->findOrFail($transfer->destination_warehouse_id);
-        $destinationLocation = $this->stockLocation($destination);
+        $destinationLocation ??= $this->stockLocation($destination);
 
         $operation = $this->createOperation(
             $transfer,
@@ -335,6 +362,7 @@ class TransferStockService
                 // ledger posts Dr 110100 C, so the layer must match
                 // (Phase 4). The original line's stored cost is the C.
                 $unitCostOverride = null;
+                $originalCostOverride = null;
 
                 if ($transfer->type === TransferType::Return && $transfer->parent_transfer_id) {
                     $originalLine = BranchTransferSaleLine::query()
@@ -345,9 +373,19 @@ class TransferStockService
                     if ($originalLine && $originalLine->cost_price_unit !== null) {
                         $unitCostOverride = (float) $originalLine->cost_price_unit;
                     }
+
+                    // A damaged return is valued at the agreed credit
+                    // V in the Scrap location, with the original C
+                    // kept on the layer for audit.
+                    if ($transfer->return_reason === 'damaged') {
+                        $unitCostOverride = (float) ($line->credit_value_unit ?? $line->transfer_price_unit);
+                        $originalCostOverride = $originalLine && $originalLine->cost_price_unit !== null
+                            ? (float) $originalLine->cost_price_unit
+                            : null;
+                    }
                 }
 
-                $this->layers->createReceiptLayer($line, $received, $destination, $destinationLocation->getKey(), $unitCostOverride);
+                $this->layers->createReceiptLayer($line, $received, $destination, $destinationLocation->getKey(), $unitCostOverride, $originalCostOverride);
             }
         }
 

@@ -47,7 +47,10 @@ class BranchTransferSale extends Model
         'name',
         'reference',
         'type',
+        'return_reason',
         'status',
+        'is_closed_short',
+        'closed_short_at',
         'transfer_date',
         'expected_date',
         'received_date',
@@ -70,6 +73,8 @@ class BranchTransferSale extends Model
     protected $casts = [
         'type'              => TransferType::class,
         'status'            => TransferStatus::class,
+        'is_closed_short'   => 'boolean',
+        'closed_short_at'   => 'datetime',
         'transfer_date'     => 'date',
         'expected_date'     => 'date',
         'received_date'     => 'datetime',
@@ -137,6 +142,18 @@ class BranchTransferSale extends Model
     public function parentTransfer(): BelongsTo
     {
         return $this->belongsTo(self::class, 'parent_transfer_id');
+    }
+
+    /** Return transfers created from this transfer (unsold / damaged). */
+    public function returnTransfers(): HasMany
+    {
+        return $this->hasMany(self::class, 'parent_transfer_id');
+    }
+
+    /** Lost / missing write-offs raised against this transfer. */
+    public function writeOffs(): HasMany
+    {
+        return $this->hasMany(BranchStockWriteOff::class, 'transfer_id');
     }
 
     /** Out_invoice posted at ship (Main bills Sub at P). Phase 4. */
@@ -234,18 +251,32 @@ class BranchTransferSale extends Model
         $this->forceFill($values)->save();
     }
 
+    /**
+     * Fully received: every line received at least the ordered
+     * quantity — or, when the transfer was closed short (Phase 5),
+     * at least the shipped quantity. The unshipped remainder was
+     * closed without delivery and never counts against receipt.
+     */
     public function isFullyReceived(): bool
     {
-        return $this->lines->every(
-            fn (BranchTransferSaleLine $line) => (float) $line->quantity_received >= (float) $line->quantity
-        );
+        return $this->lines->every(function (BranchTransferSaleLine $line) {
+            $target = $this->is_closed_short
+                ? (float) $line->quantity_shipped
+                : (float) $line->quantity;
+
+            return (float) $line->quantity_received >= $target;
+        });
     }
 
     public function isPartiallyReceived(): bool
     {
-        return $this->lines->contains(
-            fn (BranchTransferSaleLine $line) => (float) $line->quantity_received > 0
-                && (float) $line->quantity_received < (float) $line->quantity
-        );
+        return $this->lines->contains(function (BranchTransferSaleLine $line) {
+            $target = $this->is_closed_short
+                ? (float) $line->quantity_shipped
+                : (float) $line->quantity;
+
+            return (float) $line->quantity_received > 0
+                && (float) $line->quantity_received < $target;
+        });
     }
 }

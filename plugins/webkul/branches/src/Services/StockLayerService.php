@@ -4,6 +4,7 @@ namespace Webkul\Branch\Services;
 
 use Illuminate\Validation\ValidationException;
 use Webkul\Branch\Models\Branch;
+use Webkul\Branch\Models\BranchStockWriteOffLine;
 use Webkul\Branch\Models\BranchTransferSaleLine;
 use Webkul\Branch\Models\StockLayer;
 use Webkul\Inventory\Models\ProductQuantity;
@@ -80,6 +81,51 @@ class StockLayerService
      */
     public function consumeFifo(Branch $branch, BranchTransferSaleLine $line, float $quantity, int $locationId): float
     {
+        return $this->consumeLayers(
+            branch: $branch,
+            productId: (int) $line->product_id,
+            quantity: $quantity,
+            locationId: $locationId,
+            lotId: $line->lot_id,
+            label: $line->product?->name ?? "Product #{$line->product_id}",
+            recordConsumption: fn (StockLayer $layer, float $take) => $line->consumptions()->create([
+                'layer_id'  => $layer->getKey(),
+                'quantity'  => $take,
+                'unit_cost' => $layer->unit_cost,
+            ]),
+        );
+    }
+
+    /**
+     * Consume layers oldest-first for a lost / missing write-off
+     * line (addendum A3, Phase 5). Same FIFO discipline as a ship,
+     * but the consumption is recorded against the write-off line
+     * (transfer_line_id keeps the original transfer line the goods
+     * came from, so the loss is traceable both ways).
+     */
+    public function consumeFifoForWriteOff(Branch $branch, BranchStockWriteOffLine $writeOffLine, float $quantity, int $locationId): float
+    {
+        return $this->consumeLayers(
+            branch: $branch,
+            productId: (int) $writeOffLine->product_id,
+            quantity: $quantity,
+            locationId: $locationId,
+            lotId: null,
+            label: $writeOffLine->product?->name ?? "Product #{$writeOffLine->product_id}",
+            recordConsumption: fn (StockLayer $layer, float $take) => $writeOffLine->consumptions()->create([
+                'layer_id'         => $layer->getKey(),
+                'transfer_line_id' => $writeOffLine->transfer_line_id,
+                'quantity'         => $take,
+                'unit_cost'        => $layer->unit_cost,
+            ]),
+        );
+    }
+
+    /**
+     * The shared oldest-first layer consumption loop.
+     */
+    protected function consumeLayers(Branch $branch, int $productId, float $quantity, int $locationId, ?int $lotId, string $label, callable $recordConsumption): float
+    {
         $remaining = round($quantity, 4);
 
         if ($remaining <= 0) {
@@ -89,8 +135,8 @@ class StockLayerService
         $layers = StockLayer::query()
             ->available()
             ->fifo()
-            ->forStock($branch->getKey(), (int) $line->product_id, $locationId)
-            ->when($line->lot_id, fn ($query) => $query->where('lot_id', $line->lot_id))
+            ->forStock($branch->getKey(), $productId, $locationId)
+            ->when($lotId, fn ($query) => $query->where('lot_id', $lotId))
             ->lockForUpdate()
             ->get();
 
@@ -108,11 +154,7 @@ class StockLayerService
                 'quantity_remaining' => round((float) $layer->quantity_remaining - $take, 4),
             ])->save();
 
-            $line->consumptions()->create([
-                'layer_id'  => $layer->getKey(),
-                'quantity'  => $take,
-                'unit_cost' => $layer->unit_cost,
-            ]);
+            $recordConsumption($layer, $take);
 
             $costTotal += $take * (float) $layer->unit_cost;
             $consumed += $take;
@@ -121,7 +163,7 @@ class StockLayerService
 
         if ($remaining > 0.0001 || $consumed <= 0) {
             throw ValidationException::withMessages([
-                'lines' => "Not enough cost layers at {$branch->name} for {$line->product?->name}: short by {$remaining}.",
+                'lines' => "Not enough cost layers at {$branch->name} for {$label}: short by {$remaining}.",
             ]);
         }
 
@@ -142,8 +184,11 @@ class StockLayerService
      * cost C, so the caller passes $unitCostOverride = C and the
      * layer is valued at C throughout — that is what the ledger
      * posts (Dr 110100 C), so layer and ledger must agree (Phase 4).
+     * For a damaged return the scrap layer is valued at the agreed
+     * credit V instead, with the original cost C kept in
+     * $originalCostOverride for audit.
      */
-    public function createReceiptLayer(BranchTransferSaleLine $line, float $quantity, Branch $destination, int $locationId, ?float $unitCostOverride = null): StockLayer
+    public function createReceiptLayer(BranchTransferSaleLine $line, float $quantity, Branch $destination, int $locationId, ?float $unitCostOverride = null, ?float $originalCostOverride = null): StockLayer
     {
         return StockLayer::create([
             'company_id'         => $destination->company_id,
@@ -157,9 +202,11 @@ class StockLayerService
             'quantity_initial'   => round($quantity, 4),
             'quantity_remaining' => round($quantity, 4),
             'unit_cost'          => round($unitCostOverride ?? (float) $line->transfer_price_unit, 4),
-            'original_cost_unit' => $unitCostOverride !== null
-                ? round($unitCostOverride, 4)
-                : ($line->cost_price_unit === null ? null : round((float) $line->cost_price_unit, 4)),
+            'original_cost_unit' => $originalCostOverride !== null
+                ? round($originalCostOverride, 4)
+                : ($unitCostOverride !== null
+                    ? round($unitCostOverride, 4)
+                    : ($line->cost_price_unit === null ? null : round((float) $line->cost_price_unit, 4))),
             'currency_id'        => $line->transfer?->currency_id,
             'incoming_at'        => now(),
         ]);

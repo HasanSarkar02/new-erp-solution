@@ -40,6 +40,14 @@ class InternalAccountsSeeder extends Seeder
         '400100' => ['Internal Transfer Sales', AccountType::INCOME, false],
         '500100' => ['Internal Transfer COGS', AccountType::EXPENSE_DIRECT_COST, false],
         '110150' => ['Stock in Transit (Internal)', AccountType::ASSET_CURRENT, false],
+        // Inventory Damage Loss: the part of a damaged return the Sub
+        // branch absorbs (addendum A3, Phase 5). Credited when the Sub's
+        // payable falls only by the agreed credit value.
+        '644000' => ['Inventory Damage Loss', AccountType::EXPENSE, false],
+        // Inventory Loss / Shortage: goods lost or missing at a Sub
+        // branch (addendum A3, Phase 5). The loss is posted at stock
+        // value P; the Sub still owes Main unless Main forgives it.
+        '645000' => ['Inventory Loss / Shortage', AccountType::EXPENSE, false],
     ];
 
     /** code => [name, journal type, default account code] */
