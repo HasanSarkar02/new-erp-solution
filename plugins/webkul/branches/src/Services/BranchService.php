@@ -50,10 +50,16 @@ class BranchService
         $data['creator_id'] ??= $actor?->getKey() ?? User::query()->orderBy('id')->value('id');
         $data['is_active'] ??= true;
         $data['is_demo'] ??= false;
-        $data['is_main'] = (bool) ($data['is_main'] ?? ($data['type'] ?? null) === BranchType::Main->value);
-
-        $type = BranchType::tryFrom($data['type'] ?? '') ?? BranchType::Sub;
+        // The Filament form (Livewire 4) can hand us the enum instance
+        // itself instead of its string value — tryFrom() throws a
+        // TypeError on objects, so normalise first. Also covers callers
+        // passing $branch->type (the model casts type to BranchType).
+        $rawType = $data['type'] ?? '';
+        $type = $rawType instanceof BranchType
+            ? $rawType
+            : (BranchType::tryFrom(is_string($rawType) || is_int($rawType) ? $rawType : '') ?? BranchType::Sub);
         $data['type'] = $type->value;
+        $data['is_main'] = (bool) ($data['is_main'] ?? $type === BranchType::Main);
 
         $this->validate($data);
 

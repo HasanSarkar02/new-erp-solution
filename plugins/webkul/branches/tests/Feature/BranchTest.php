@@ -183,3 +183,32 @@ it('limits a branch user to their assigned branches', function () {
     expect($visible)->toContain('SCOPE-01')
         ->and($visible)->not->toContain('SCOPE-02');
 });
+
+it('creates a branch when type arrives as an enum instance (Filament/Livewire form)', function () {
+    // Regression: the Filament create form (Livewire 4) hands the service
+    // the BranchType enum itself, not its string value — tryFrom() threw
+    // a TypeError on the object (reported from a live install, 2026-11-22).
+    $branch = $this->service->create(branchData([
+        'code' => 'ENUM-01',
+        'name' => 'Enum Showroom',
+        'type' => BranchType::Sub,
+    ]));
+
+    expect($branch->type)->toBe(BranchType::Sub)
+        ->and($branch->is_main)->toBeFalse();
+
+    // A second Main is rejected while one exists, so retire the seeded
+    // Main first (force-delete: the check uses withoutGlobalScopes, so a
+    // soft-delete would still count), then prove an enum Main still
+    // derives is_main = true.
+    Branch::query()->where('is_main', true)->forceDelete();
+
+    $main = $this->service->create(branchData([
+        'code' => 'ENUM-02',
+        'name' => 'Enum Main',
+        'type' => BranchType::Main,
+    ]));
+
+    expect($main->type)->toBe(BranchType::Main)
+        ->and($main->is_main)->toBeTrue();
+});
