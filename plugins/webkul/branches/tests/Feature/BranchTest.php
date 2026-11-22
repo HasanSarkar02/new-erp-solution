@@ -159,7 +159,11 @@ it('loads the branch list page in the admin panel', function () {
 
     $this->actingAs($this->admin)
         ->get('/admin/branches')
-        ->assertOk();
+        ->assertOk()
+        // Regression: ListBranches never defined a header CreateAction,
+        // so no "New branch" button rendered at all (reported 2026-11-22
+        // from a live install — the page looked complete otherwise).
+        ->assertSee('New branch');
 });
 
 it('limits a branch user to their assigned branches', function () {
