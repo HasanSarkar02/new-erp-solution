@@ -344,6 +344,30 @@ it('confirms a Sub to Sub transfer after Main approval', function () {
     expect($transfer->status)->toBe(TransferStatus::Confirmed);
 });
 
+it('accepts a TransferType enum instance from a Livewire form payload', function () {
+    $otherSub = app(BranchService::class)->create([
+        'code' => 'UTT-03',
+        'name' => 'Uttara Showroom 3',
+        'type' => 'sub',
+    ]);
+
+    $product = transferProduct($this->company->id, $this->admin->getKey());
+    stockAt($product, $this->sub, 10);
+
+    // Livewire 4 hands Filament enum selects as the enum instance, not
+    // the string value — this used to TypeError in resolveType().
+    $transfer = $this->service->create([
+        'source_branch_id'      => $this->sub->getKey(),
+        'destination_branch_id' => $otherSub->getKey(),
+        'type'                  => TransferType::Rebalance,
+        'lines'                 => [
+            ['product_id' => $product->getKey(), 'quantity' => 2],
+        ],
+    ]);
+
+    expect($transfer->type)->toBe(TransferType::Rebalance);
+});
+
 it('cancels a draft without any stock or accounting effect', function () {
     $product = transferProduct($this->company->id, $this->admin->getKey());
     $before = countStockAndAccounting();

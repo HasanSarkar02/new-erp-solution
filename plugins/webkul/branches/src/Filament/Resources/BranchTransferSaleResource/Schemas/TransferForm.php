@@ -49,23 +49,23 @@ class TransferForm
                                             ->where('type', 'main')
                                             ->orderBy('id')
                                             ->value('id');
-                                    })
-                                    ->live(),
+                                    }),
+                                // No live(): nothing in this form re-renders
+                                // off a branch change — the product picker
+                                // reads the branches via Get when it runs.
 
                                 Select::make('destination_branch_id')
                                     ->label('To branch')
                                     ->relationship('destinationBranch', 'name')
                                     ->searchable()
                                     ->preload()
-                                    ->required()
-                                    ->live(),
+                                    ->required(),
 
                                 Select::make('type')
                                     ->label('Transfer type')
                                     ->options(TransferType::class)
                                     ->required()
-                                    ->default(TransferType::Supply->value)
-                                    ->live(),
+                                    ->default(TransferType::Supply->value),
 
                                 DatePicker::make('transfer_date')
                                     ->label('Transfer date')
@@ -146,7 +146,10 @@ class TransferForm
                                             ->required()
                                             ->minValue(0.0001)
                                             ->default(1)
-                                            ->live()
+                                            // onBlur, not per keystroke: the subtotal
+                                            // is qty x price, so a server round-trip
+                                            // on every keypress only made typing lag.
+                                            ->live(onBlur: true)
                                             ->afterStateUpdated(fn (Set $set, Get $get) => static::refreshSubtotal($set, $get)),
 
                                         TextInput::make('available_qty')
@@ -160,7 +163,9 @@ class TransferForm
                                             ->numeric()
                                             ->required()
                                             ->minValue(0)
-                                            ->live()
+                                            // Same as quantity: onBlur only, so
+                                            // typing a price never fires a request.
+                                            ->live(onBlur: true)
                                             ->afterStateUpdated(fn (Set $set, Get $get) => static::refreshSubtotal($set, $get))
                                             ->helperText('Suggested from the price rules — override freely.'),
 

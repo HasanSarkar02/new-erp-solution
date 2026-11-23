@@ -726,8 +726,17 @@ class BranchTransferService
             && $transfer->parent_transfer_id !== null;
     }
 
-    protected function resolveType(Branch $source, Branch $destination, ?string $requestedType): TransferType
+    /**
+     * Livewire 4 hands Filament enum selects as the enum instance, not
+     * the string value — the same trap as BranchService::create().
+     * Accept both so a form payload never TypeErrors here.
+     */
+    protected function resolveType(Branch $source, Branch $destination, TransferType|string|null $requestedType): TransferType
     {
+        if ($requestedType instanceof TransferType) {
+            return $requestedType;
+        }
+
         if ($requestedType) {
             $type = TransferType::tryFrom($requestedType)
                 ?? throw ValidationException::withMessages(['type' => 'Unknown transfer type.']);
